@@ -139,17 +139,34 @@ def is_group_filename(filename):
 
 def extract_contact_name(html_content, filename):
     """
-    Extract the first non-Me sender name from a SINGLE-PERSON conversation.
+    Extract the first non-Me sender name from RECEIVED messages in a SINGLE-PERSON conversation.
     Only runs on files whose stem is a bare phone number (no commas, no spaces).
     Returns None for group conversations and named groups.
+
+    By only scanning received messages (not sent), we always find the contact's name,
+    even if the user ran imessage-exporter with a custom -m name replacing "Me".
     """
     if is_group_filename(filename):
         return None
-    matches = re.findall(r'<span class="sender">([^<]+)</span>', html_content)
-    for name in matches:
-        name = name.strip()
-        if name and name != "Me":
-            return name
+
+    # Split by message block start markers and process each block
+    blocks = re.split(r'(?=<div class="message")', html_content)
+
+    for block in blocks:
+        if '<div class="message">' not in block:
+            continue
+
+        # Skip sent messages — only extract from received messages
+        if 'class="sent' in block:
+            continue
+
+        # Extract sender name from this received message block
+        match = re.search(r'<span class="sender">([^<]+)</span>', block)
+        if match:
+            name = match.group(1).strip()
+            if name and name != "Me":
+                return name
+
     return None
 
 
