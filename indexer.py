@@ -127,11 +127,14 @@ def parse_timestamp(ts_str):
 
 def is_phone_number(s):
     """
-    Return True only for standard North American E.164 numbers: +1XXXXXXXXXX
-    (plus sign, country code 1, 10 digits = 12 chars total).
-    Rejects short codes, email handles, international non-NA numbers, etc.
+    Return True for E.164-style phone numbers: a leading "+" followed by
+    7-15 digits (E.164's own length bounds for a full international
+    number). Covers North American numbers (+1 plus 10 digits) as well as
+    any other country's numbers, without assuming a fixed digit count.
+    Rejects short codes and alphanumeric sender IDs (no leading "+" in
+    this system's exports) and email handles.
     """
-    return bool(re.fullmatch(r'\+1\d{10}', s.strip()))
+    return bool(re.fullmatch(r'\+\d{7,15}', s.strip()))
 
 
 def is_group_filename(filename):
