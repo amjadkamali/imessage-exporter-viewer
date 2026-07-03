@@ -38,8 +38,9 @@ def get_db():
 def get_phone_to_name():
     """
     Build a phone->name map from resolved 1:1 conversations, cached on app.
-    Any conversation whose filename stem is a bare NA phone number (+1XXXXXXXXXX)
-    and whose stored name differs from that number is a resolved mapping.
+    Any conversation whose filename stem is a bare E.164 phone number
+    (+ followed by 7-15 digits) and
+    whose stored name differs from that number is a resolved mapping.
     """
     if not hasattr(app, '_phone_to_name'):
         conn = get_db()
@@ -48,7 +49,7 @@ def get_phone_to_name():
         mapping = {}
         for row in rows:
             stem = row['filename'].replace('.html', '')
-            if re.fullmatch(r'\+1\d{10}', stem) and row['name'] != stem:
+            if re.fullmatch(r'\+\d{7,15}', stem) and row['name'] != stem:
                 mapping[stem] = row['name']
         app._phone_to_name = mapping
     return app._phone_to_name
@@ -1225,7 +1226,7 @@ def api_conversation():
             # Substitute raw phone numbers with resolved names in sender spans
             def rewrite_sender(m2):
                 return '<span class="sender">' + resolve_sender(m2.group(1)) + '</span>'
-            d["raw_html"] = re.sub(r'<span class="sender">(\+1\d{10})</span>', rewrite_sender, d["raw_html"])
+            d["raw_html"] = re.sub(r'<span class="sender">(\+\d{7,15})</span>', rewrite_sender, d["raw_html"])
         # Also resolve sender field used by the fallback (non-raw_html) renderer
         d["sender"] = resolve_sender(d.get("sender"))
         return d
