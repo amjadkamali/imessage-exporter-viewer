@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
-LABEL org.opencontainers.image.title="iMessage Search"
-LABEL org.opencontainers.image.description="Self-hosted iMessage search and browser for imessage-exporter archives"
+LABEL org.opencontainers.image.title="iMessage Search (fork)"
+LABEL org.opencontainers.image.description="Self-hosted iMessage search and browser, adapted for a -c disabled export layout (Attachments/StickerCache instead of attachments/)"
 LABEL org.opencontainers.image.source="https://github.com/mbaran5/imessage-exporter-viewer"
 LABEL org.opencontainers.image.licenses="MIT"
 

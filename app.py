@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""iMessage Search - Flask web app"""
+"""iMessage Search - Flask web app
+
+FORKED from https://github.com/mbaran5/imessage-exporter-viewer to work with
+a different attachment-storage layout: the upstream project assumes the
+standard `imessage-exporter -c clone/basic/full` layout (attachments
+physically copied into a lowercase "attachments/" folder next to the HTML).
+This fork's source pipeline instead uses `-c disabled`, with attachments
+referenced in place under separately-named "Attachments/" and
+"StickerCache/" folders (capitalized, matching Apple's own naming).
+
+Search "FORK:" for every change from the verified upstream source. All
+patches are additive/flexible (checking multiple recognized folder names)
+rather than replacing upstream's own behavior, so this also still works
+correctly against the standard layout if ever pointed at one.
+"""
 
 import os
 import re
@@ -8,7 +22,7 @@ import io
 import mimetypes
 from pathlib import Path
 from urllib.parse import quote
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, redirect
 
 DB_PATH      = os.environ.get("DB_PATH", "/data/imessage.db")
 ARCHIVE_ROOT = os.environ.get("ARCHIVE_ROOT", "/archives")
@@ -45,6 +59,22 @@ def resolve_sender(sender):
         return sender
     return get_phone_to_name().get(sender, sender)
 
+# FORK: this project's source pipeline uses `imessage-exporter -c disabled`,
+# which stores attachments under separately-named "Attachments/" and
+# "StickerCache/" folders (capitalized, matching Apple's own naming),
+# instead of the standard `-c clone/basic/full` layout's single lowercase
+# "attachments/" folder this upstream project assumes everywhere. These
+# three helpers centralize the folder-name flexibility needed at every
+# point that previously hardcoded a literal "attachments/" prefix.
+ATTACHMENT_DIR_NAMES = ("attachments", "Attachments", "StickerCache")
+ATTACHMENT_PREFIX_RE = re.compile(r'^(?:attachments|Attachments|StickerCache)/')
+ATTACHMENT_SRC_RE = re.compile(r'src="((?:attachments|Attachments|StickerCache)/[^"]+)"')
+ATTACHMENT_HREF_RE = re.compile(r'href="((?:attachments|Attachments|StickerCache)/[^"]+)"')
+
+def strip_attachment_prefix(path):
+    """Strip whichever of the recognized attachment-folder prefixes is present."""
+    return ATTACHMENT_PREFIX_RE.sub('', path, count=1)
+
 # ── CSS ───────────────────────────────────────────────────────────────────────
 
 CSS = """
@@ -54,14 +84,23 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 .header { background: #2c2c2e; padding: 12px 20px; display: flex; align-items: center;
           gap: 16px; border-bottom: 1px solid #3a3a3c; flex-shrink: 0; }
 .header h1 { font-size: 18px; font-weight: 600; }
+.header h1 a { text-decoration: none; cursor: pointer; }
 .search-bar { flex: 1; display: flex; gap: 8px; max-width: 600px; }
-.search-bar input { flex: 1; background: #3a3a3c; border: none; border-radius: 10px;
-                    padding: 8px 14px; color: #f2f2f7; font-size: 15px; outline: none; }
-.search-bar input::placeholder { color: #8e8e93; }
-.search-bar button { background: #0a84ff; border: none; border-radius: 10px;
+.search-input-wrap { position: relative; flex: 1; }
+.search-input-wrap input { width: 100%; background: #3a3a3c; border: none; border-radius: 10px;
+                    padding: 8px 34px 8px 14px; color: #f2f2f7; font-size: 15px; outline: none; }
+.search-input-wrap input::placeholder { color: #8e8e93; }
+.search-input-clear { display: none; position: absolute; right: 6px; top: 50%;
+                      transform: translateY(-50%); align-items: center; justify-content: center;
+                      width: 22px; height: 22px; padding: 0; background: none; border: none;
+                      color: #8e8e93; font-size: 18px; line-height: 1; cursor: pointer; }
+.search-input-clear:hover { color: #f2f2f7; }
+.search-input-wrap input:not(:placeholder-shown) + .search-input-clear { display: flex; }
+.search-bar button { background: #48484a; border: none; border-radius: 10px;
                      padding: 8px 16px; color: white; font-size: 14px; cursor: pointer; }
-.search-bar button:hover { background: #0071e3; }
-.nav a { color: #0a84ff; text-decoration: none; font-size: 14px; white-space: nowrap; }
+.search-bar button:hover { background: #636366; }
+.search-bar button.active { background: #0a84ff; }
+.search-bar button.active:hover { background: #0071e3; }
 .main { display: flex; flex: 1; overflow: hidden; }
 .conv-list { width: 280px; background: #2c2c2e; border-right: 1px solid #3a3a3c;
              overflow-y: auto; flex-shrink: 0; }
@@ -98,15 +137,15 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 .loading-bar { text-align: center; padding: 8px; color: #8e8e93; font-size: 12px; flex-shrink: 0; }
 .date-jump { display: flex; gap: 6px; align-items: center; padding: 6px 16px;
              background: #2c2c2e; border-bottom: 1px solid #3a3a3c; flex-shrink: 0; }
+.conv-search { display: flex; gap: 8px; align-items: center; padding: 6px 16px;
+             background: #2c2c2e; border-bottom: 1px solid #3a3a3c; flex-shrink: 0; }
+.conv-search input { flex: 1; background: #3a3a3c; border: none; border-radius: 8px;
+             padding: 6px 12px; color: #f2f2f7; font-size: 13px; outline: none; }
+.conv-search-count { font-size: 12px; color: #8e8e93; white-space: nowrap; min-width: 70px; text-align: right; }
 .date-jump label { font-size: 11px; color: #8e8e93; white-space: nowrap; }
-.date-jump input[type="month"] { background: #3a3a3c; border: none; border-radius: 8px;
+.date-jump select { background: #3a3a3c; border: none; border-radius: 8px;
   padding: 4px 8px; color: #f2f2f7; font-size: 12px; outline: none; cursor: pointer; }
-.date-jump input[type="month"]::-webkit-calendar-picker-indicator { filter: invert(0.8); cursor: pointer; }
-.year-pills { display: flex; gap: 4px; flex-wrap: wrap; flex: 1; }
-.year-pill { background: #3a3a3c; border: none; border-radius: 6px; padding: 3px 8px;
-             color: #8e8e93; font-size: 11px; cursor: pointer; white-space: nowrap; }
-.year-pill:hover { background: #48484a; color: #f2f2f7; }
-.year-pill.active { background: #0a84ff; color: white; }
+.date-jump .btn { margin-left: auto; }
 .msg-highlight { outline: 2px solid #ffd60a !important; border-radius: 20px !important; outline-offset: 3px !important; }
 .results-pane { flex: 1; overflow-y: auto; padding: 16px; }
 .sort-bar { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; }
@@ -155,6 +194,22 @@ span.reply_context { opacity: 0.6; font-size: 0.85em; font-style: italic; displa
 .tapback { display: inline-block; margin-right: 6px; }
 .announcement { text-align: center; padding: 8px; color: #666; font-size: 0.85em; }
 .edited { font-size: 0.85em; opacity: 0.8; }
+
+/* Find-a-thread box, sits above the sort bar in the sidebar */
+.thread-finder { padding: 10px 10px 0; flex-shrink: 0; }
+.thread-finder-wrap { position: relative; }
+.thread-finder input { width: 100%; background: #3a3a3c; border: none; border-radius: 8px;
+                       padding: 6px 28px 6px 10px; color: #f2f2f7; font-size: 13px; outline: none; }
+.thread-finder input::placeholder { color: #8e8e93; }
+.thread-finder-clear { display: none; position: absolute; right: 4px; top: 50%;
+                       transform: translateY(-50%); align-items: center; justify-content: center;
+                       width: 20px; height: 20px; padding: 0; background: none; border: none;
+                       color: #8e8e93; font-size: 16px; line-height: 1; cursor: pointer; }
+.thread-finder-clear:hover { color: #f2f2f7; }
+/* Shown only once the input actually has content -- :placeholder-shown is
+   well-supported cross-browser (Safari 9.1+), unlike <input type="month">,
+   so this is safe to rely on without a JS-driven visibility toggle. */
+.thread-finder input:not(:placeholder-shown) + .thread-finder-clear { display: flex; }
 
 /* Conv list sort bar */
 .conv-sort { display: flex; gap: 4px; padding: 8px 10px; border-bottom: 1px solid #3a3a3c; flex-shrink: 0; }
@@ -207,9 +262,6 @@ span.reply_context { opacity: 0.6; font-size: 0.85em; font-style: italic; displa
                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .img-card-info { font-size: 11px; color: #8e8e93; margin-top: 2px;
                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.search-bar button.img-btn { background: #48484a; }
-.search-bar button.img-btn:hover { background: #636366; }
-.search-bar button.img-btn.active { background: #0a84ff; }
 .img-pagination { display: flex; gap: 10px; align-items: center; margin: 10px 0; }
 
 /* ── Mobile back button: hidden on desktop ── */
@@ -219,7 +271,6 @@ span.reply_context { opacity: 0.6; font-size: 0.85em; font-style: italic; displa
   /* Header: search bar wraps to its own line */
   .header { flex-wrap: wrap; padding: 8px 12px; gap: 6px; }
   .search-bar { order: 3; width: 100%; max-width: none; flex: none; }
-  .nav { margin-left: auto; }
 
   /* Sidebar: full-width, toggled by JS class */
   .conv-list { width: 100%; border-right: none; }
@@ -342,17 +393,26 @@ def index():
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💬</text></svg>">
 <title>iMessage Search</title><style>""" + CSS + """</style></head><body>
 <div class="header">
-  <h1>💬</h1>
+  <h1><a href="/">💬</a></h1>
   <div class="search-bar">
-    <input type="text" id="searchInput" placeholder="Search messages..."
-           onkeydown="if(event.key==='Enter')doSearch()">
-    <button onclick="doSearch()">Messages</button>
-    <button onclick="doImageSearch()" class="img-btn">Images</button>
+    <div class="search-input-wrap">
+      <input type="text" id="searchInput" placeholder="Search messages..."
+             onkeydown="if(event.key==='Enter')setSearchMode(searchMode)">
+      <button type="button" class="search-input-clear" onclick="clearMainSearch()" title="Clear" tabindex="-1">&times;</button>
+    </div>
+    <button id="modeMessagesBtn" class="active" onclick="setSearchMode('messages')">Messages</button>
+    <button id="modeImagesBtn" onclick="setSearchMode('images')">Images</button>
   </div>
-  <div class="nav"><a href="/">Conversations</a></div>
 </div>
 <div class="main">
   <div class="conv-list">
+    <div class="thread-finder">
+      <div class="thread-finder-wrap">
+        <input type="text" id="recipientInput" placeholder="Find a thread (name or number)"
+               oninput="filterThreads()">
+        <button type="button" class="thread-finder-clear" onclick="clearThreadFilter()" title="Clear" tabindex="-1">&times;</button>
+      </div>
+    </div>
     <div class="conv-sort">
       <button id="sortRecent" class="active" onclick="setSort('recent')">Recent</button>
       <button id="sortAlpha" onclick="setSort('alpha')">A – Z</button>
@@ -369,13 +429,38 @@ def index():
       </div>
       <div class="page-controls">
         <span class="page-info" id="pageInfo"></span>
+        <button class="btn" id="convSearchToggleBtn" onclick="toggleConvSearch()" title="Search this conversation">&#128269;</button>
+        <button class="btn" id="dateJumpToggleBtn" onclick="toggleDateJump()" title="Jump to date" disabled>&#128197;</button>
+        <button class="btn" id="jumpTopBtn" onclick="jumpToTop()" title="Jump to top">&#8607;</button>
         <button class="btn" id="jumpBottomBtn" onclick="jumpToBottom()" title="Jump to bottom">&#8609;</button>
       </div>
     </div>
+    <div class="conv-search" id="convSearch" style="display:none">
+      <input type="text" id="convSearchInput" placeholder="Search this conversation..."
+             oninput="debounceConvSearch()" onkeydown="handleConvSearchKey(event)">
+      <span class="conv-search-count" id="convSearchCount"></span>
+      <button class="btn" onclick="convSearchPrev()" title="Previous match (Shift+Enter)">&#8593;</button>
+      <button class="btn" onclick="convSearchNext()" title="Next match (Enter)">&#8595;</button>
+      <button class="btn" onclick="closeConvSearch()" title="Close">&times;</button>
+    </div>
     <div class="date-jump" id="dateJump" style="display:none">
       <label>Jump to:</label>
-      <input type="month" id="monthPicker" onchange="jumpToMonth(this.value)" title="Pick a month">
-      <div class="year-pills" id="yearPills"></div>
+      <select id="monthSelect" onchange="jumpToMonthYear()" title="Month">
+        <option value="01">Jan</option>
+        <option value="02">Feb</option>
+        <option value="03">Mar</option>
+        <option value="04">Apr</option>
+        <option value="05">May</option>
+        <option value="06">Jun</option>
+        <option value="07">Jul</option>
+        <option value="08">Aug</option>
+        <option value="09">Sep</option>
+        <option value="10">Oct</option>
+        <option value="11">Nov</option>
+        <option value="12">Dec</option>
+      </select>
+      <select id="yearSelect" onchange="jumpToMonthYear()" title="Year"></select>
+      <button class="btn" onclick="closeDateJump()" title="Close">&times;</button>
     </div>
     <div class="messages" id="messages">
       <div class="empty"><div class="empty-icon">💬</div><div>Select a conversation</div></div>
@@ -412,15 +497,34 @@ function showConvList() {
   document.querySelector('.conv-list').classList.remove('mobile-hidden');
 }
 
-// ── Search / sort ─────────────────────────────────────────────────────────────
-function doSearch() {
+// ── Search mode toggle ────────────────────────────────────────────────────────
+// Messages/Images act as a persistent mode selector rather than an
+// immediate-navigate button: clicking one always updates which mode is
+// "armed", but only actually navigates to results if there's a query
+// typed. With nothing typed, clicking Images just marks it active and
+// stays right here -- there's nothing to search yet, so there's no
+// separate "enter a query" page to land on.
+var searchMode = 'messages';
+
+function setSearchMode(mode) {
+  searchMode = mode;
+  var msgBtn = document.getElementById('modeMessagesBtn');
+  var imgBtn = document.getElementById('modeImagesBtn');
+  if (msgBtn) msgBtn.classList.toggle('active', mode === 'messages');
+  if (imgBtn) imgBtn.classList.toggle('active', mode === 'images');
   var q = document.getElementById('searchInput').value.trim();
-  if (q) window.location.href = '/search?q=' + encodeURIComponent(q);
+  if (!q) return;
+  window.location.href = (mode === 'messages' ? '/search?q=' : '/search/images?q=') + encodeURIComponent(q);
 }
 
-function doImageSearch() {
-  var q = document.getElementById('searchInput').value.trim();
-  window.location.href = q ? '/search/images?q=' + encodeURIComponent(q) : '/search/images';
+function clearMainSearch() {
+  var input = document.getElementById('searchInput');
+  input.value = '';
+  if (window.location.pathname !== '/') {
+    window.location.href = '/';
+  } else {
+    input.focus();
+  }
 }
 
 function setSort(mode) {
@@ -430,10 +534,39 @@ function setSort(mode) {
   document.getElementById('sortAlpha').className  = mode === 'alpha'  ? 'active' : '';
 }
 
+// ── Find a thread ─────────────────────────────────────────────────────────────
+// Live, client-side filter of the sidebar as you type -- no server round
+// trip, since every conversation is already rendered in the DOM (in both
+// the Recent and A-Z lists). Matches against the visible display name
+// (resolved contact/group name) or the raw filename (which for 1:1 threads
+// is the phone number/handle itself, so partial digits work too).
+function filterThreads() {
+  var recip = document.getElementById('recipientInput').value.trim().toLowerCase();
+  document.querySelectorAll('.conv-item').forEach(function(item) {
+    if (!recip) { item.style.display = ''; return; }
+    var nameEl = item.querySelector('.conv-name');
+    var name = nameEl ? nameEl.textContent.toLowerCase() : '';
+    var fn = (item.getAttribute('data-fn') || '').toLowerCase();
+    var match = name.indexOf(recip) !== -1 || fn.indexOf(recip) !== -1;
+    item.style.display = match ? '' : 'none';
+  });
+}
+
+function clearThreadFilter() {
+  var input = document.getElementById('recipientInput');
+  input.value = '';
+  filterThreads();
+  input.focus();
+}
+
 // ── Conversation load ─────────────────────────────────────────────────────────
 function loadConv(el) {
   var fn = el.getAttribute('data-fn');
   currentFn = fn; hlTs = null; hlMid = null;
+  closeConvSearch();
+  closeDateJump();
+  document.getElementById('dateJumpToggleBtn').disabled = true;
+  dateJumpInitializedFor = null;
   document.querySelectorAll('.conv-item').forEach(function(e){ e.classList.remove('active'); });
   el.classList.add('active');
   el.scrollIntoView({block: 'nearest'});
@@ -547,9 +680,26 @@ function fetchRows(unused, mode) {
             }
             requestAnimationFrame(holdPosition);
           }
-          // For date jumps (initial-top), scroll to top so target is first visible.
+          // For date jumps (initial-top), scroll to top so target is first
+          // visible. Date/year jumps always target "the first message at
+          // or after a given row" -- since initial-top mode fetches a
+          // window STARTING exactly at that row, the first rendered
+          // message-row IS the target. It's highlighted directly here
+          // rather than through the hlMid/hlTs matching above, since that
+          // matching only works when the target's own id or exact
+          // timestamp is already known (search results, reply arrows) --
+          // neither of which applies to "whatever's first on or after this
+          // month", so without this, a date/year jump would silently
+          // scroll with no visual confirmation anything happened.
           if (typeof mode === 'string' && mode.startsWith('initial-top:')) {
             document.getElementById('messages').scrollTop = 0;
+            if (!target) {
+              var firstRow = c.querySelector('.message-row');
+              if (firstRow) {
+                firstRow.classList.add('msg-highlight');
+                setTimeout(function(){ firstRow.classList.remove('msg-highlight'); }, 2500);
+              }
+            }
           }
           // Clear state and stale classes AFTER we've captured target above
           hlTs = null; hlMid = null;
@@ -739,7 +889,119 @@ function flashHighlight(el) {
   setTimeout(function(){ el.classList.remove('msg-highlight'); }, 2500);
 }
 
-// ── Jump to bottom ────────────────────────────────────────────────────────────
+// ── Search within conversation ────────────────────────────────────────────────
+// Reuses the exact same jump mechanism as global search results and reply
+// arrows: look up a message's row number via /api/message_page, then fetch
+// a window of messages centered on that row (fetchRows('initial-row:...')),
+// then scroll to and highlight the target once it renders. See
+// jumpToConvSearchResult() below -- it's essentially the same code that
+// already runs after a global search result click or a reply-arrow click,
+// just triggered from a different place.
+var convSearchResults = [];
+var dateJumpInitializedFor = null; // currentFn value the month/year selects were last populated for
+var convSearchIdx = -1;
+var convSearchDebounce = null;
+
+function toggleConvSearch() {
+  var bar = document.getElementById('convSearch');
+  if (bar.style.display === 'none') {
+    bar.style.display = 'flex';
+    document.getElementById('convSearchInput').focus();
+  } else {
+    closeConvSearch();
+  }
+}
+
+function closeConvSearch() {
+  document.getElementById('convSearch').style.display = 'none';
+  document.getElementById('convSearchInput').value = '';
+  document.getElementById('convSearchCount').textContent = '';
+  convSearchResults = [];
+  convSearchIdx = -1;
+}
+
+function handleConvSearchKey(e) {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (e.shiftKey) convSearchPrev(); else convSearchNext();
+  } else if (e.key === 'Escape') {
+    closeConvSearch();
+  }
+}
+
+function debounceConvSearch() {
+  clearTimeout(convSearchDebounce);
+  convSearchDebounce = setTimeout(runConvSearch, 250);
+}
+
+function runConvSearch() {
+  var q = document.getElementById('convSearchInput').value.trim();
+  convSearchResults = [];
+  convSearchIdx = -1;
+  if (!q || !currentFn) {
+    updateConvSearchCount();
+    return;
+  }
+  fetch('/api/conversation_search?filename=' + encodeURIComponent(currentFn) + '&q=' + encodeURIComponent(q))
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      convSearchResults = d.results || [];
+      convSearchIdx = convSearchResults.length ? 0 : -1;
+      updateConvSearchCount();
+      if (convSearchIdx >= 0) jumpToConvSearchResult(convSearchIdx);
+    });
+}
+
+function updateConvSearchCount() {
+  var el = document.getElementById('convSearchCount');
+  var q = document.getElementById('convSearchInput').value.trim();
+  if (!convSearchResults.length) {
+    el.textContent = q ? 'No matches' : '';
+  } else {
+    el.textContent = (convSearchIdx + 1) + ' of ' + convSearchResults.length;
+  }
+}
+
+function convSearchNext() {
+  if (!convSearchResults.length) return;
+  convSearchIdx = (convSearchIdx + 1) % convSearchResults.length;
+  updateConvSearchCount();
+  jumpToConvSearchResult(convSearchIdx);
+}
+
+function convSearchPrev() {
+  if (!convSearchResults.length) return;
+  convSearchIdx = (convSearchIdx - 1 + convSearchResults.length) % convSearchResults.length;
+  updateConvSearchCount();
+  jumpToConvSearchResult(convSearchIdx);
+}
+
+function jumpToConvSearchResult(idx) {
+  var target = convSearchResults[idx];
+  if (!target || !currentFn) return;
+  var existing = document.querySelector('.message-row[data-mid="' + target.id + '"]');
+  if (existing) { existing.scrollIntoView({block: 'center'}); flashHighlight(existing); return; }
+  fetch('/api/message_page?filename=' + encodeURIComponent(currentFn) + '&msg_id=' + encodeURIComponent(target.id) + '&per_page=' + WIN)
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (!d.row) return;
+      hlMid = target.id;
+      resetPane();
+      fetchRows(null, 'initial-row:' + (d.row - 1));
+    });
+}
+
+// ── Jump to top / bottom ──────────────────────────────────────────────────────
+function jumpToTop() {
+  // Reuses 'initial-top' mode (built for date/year jumps) targeting row 0 --
+  // this also gets the first-message highlight flash for free, since that
+  // mode already highlights whatever rendered first when no specific
+  // hlMid/hlTs target is set.
+  hlTs = null; hlMid = null;
+  resetPane();
+  fetchRows(null, 'initial-top:0');
+}
+
 function jumpToBottom() {
   resetPane();
   fetchRows(null, 'initial-bottom');
@@ -753,36 +1015,65 @@ function updateHeader(name, total) {
   document.getElementById('pageInfo').textContent = total.toLocaleString() + ' messages';
 }
 
+function toggleDateJump() {
+  var bar = document.getElementById('dateJump');
+  if (bar.style.display === 'flex') closeDateJump();
+  else bar.style.display = 'flex';
+}
+
+function closeDateJump() {
+  document.getElementById('dateJump').style.display = 'none';
+}
+
 function updateDateJump(firstDate, lastDate) {
   if (!firstDate || !lastDate) return;
-  var bar = document.getElementById('dateJump');
-  var picker = document.getElementById('monthPicker');
-  var pillsEl = document.getElementById('yearPills');
 
-  bar.style.display = 'flex';
+  // Visibility is controlled entirely by toggleDateJump() (the calendar
+  // icon button) rather than being forced open here -- this function's
+  // only job is keeping the selects populated and correct for the current
+  // conversation. The toggle button gets enabled here since only now do we
+  // know this conversation actually has a usable date range.
+  document.getElementById('dateJumpToggleBtn').disabled = false;
 
-  // Set month picker bounds
-  picker.min = firstDate.slice(0, 7);  // YYYY-MM
-  picker.max = lastDate.slice(0, 7);
+  // fetchRows() calls this on EVERY response, including the one triggered
+  // by jumpToMonth() itself when the user picks a date -- without this
+  // guard, that follow-up call would immediately reset both selects back
+  // to the most recent month/year, undoing the user's own selection. Only
+  // (re)populate when the conversation actually changed.
+  if (dateJumpInitializedFor === currentFn) return;
+  dateJumpInitializedFor = currentFn;
 
-  // Build year pills from firstYear to lastYear
+  var monthSel = document.getElementById('monthSelect');
+  var yearSel = document.getElementById('yearSelect');
+
   var firstYear = parseInt(firstDate.slice(0, 4));
   var lastYear  = parseInt(lastDate.slice(0, 4));
-  pillsEl.innerHTML = '';
+  var lastMonth = lastDate.slice(5, 7);
+
+  monthSel.value = lastMonth;
+
+  // Populate the year dropdown. Defaults to the most recent year, since
+  // that's usually where you're already reading -- picking a month then
+  // just needs one more selection instead of two.
+  yearSel.innerHTML = '';
   for (var y = firstYear; y <= lastYear; y++) {
-    var btn = document.createElement('button');
-    btn.className = 'year-pill';
-    btn.textContent = y;
-    btn.setAttribute('data-year', y);
-    btn.onclick = (function(year) {
-      return function() { jumpToYear(year); };
-    })(y);
-    pillsEl.appendChild(btn);
+    var opt = document.createElement('option');
+    opt.value = y;
+    opt.textContent = y;
+    if (y === lastYear) opt.selected = true;
+    yearSel.appendChild(opt);
   }
 }
 
+function jumpToMonthYear() {
+  var m = document.getElementById('monthSelect').value;
+  var y = document.getElementById('yearSelect').value;
+  if (!m || !y) return;
+  jumpToMonth(y + '-' + m);
+}
+
 function jumpToMonth(val) {
-  // val is "YYYY-MM" from the month picker
+  // val is "YYYY-MM"
   if (!val || !currentFn) return;
   var ts = val + '-01T00:00:00';
   fetch('/api/message_page?filename=' + encodeURIComponent(currentFn)
@@ -793,14 +1084,6 @@ function jumpToMonth(val) {
       resetPane();
       fetchRows(null, 'initial-top:' + (d.row - 1));
     });
-}
-
-function jumpToYear(year) {
-  // Highlight the active year pill
-  document.querySelectorAll('.year-pill').forEach(function(p) {
-    p.classList.toggle('active', parseInt(p.getAttribute('data-year')) === year);
-  });
-  jumpToMonth(year + '-01');
 }
 
 function showLoading(on) {
@@ -922,18 +1205,23 @@ def api_conversation():
         d = dict(m)
         aid = str(d.get("archive_id", ""))
         if d.get("attachment_path") and aid:
-            d["attachment_url"] = "/attachments/" + aid + "/" + d["attachment_path"].replace("attachments/", "", 1)
+            # FORK: use strip_attachment_prefix() instead of a literal
+            # .replace("attachments/", "", 1) so this also works for
+            # attachment_path values under "Attachments/" or "StickerCache/".
+            d["attachment_url"] = "/attachments/" + aid + "/" + strip_attachment_prefix(d["attachment_path"])
         else:
             d["attachment_url"] = None
         if d.get("raw_html") and aid:
             def rewrite_src(m2):
                 p = m2.group(1)
-                return 'src="/attachments/' + aid + '/' + p.replace("attachments/", "", 1) + '"'
+                return 'src="/attachments/' + aid + '/' + strip_attachment_prefix(p) + '"'
             def rewrite_href(m2):
                 p = m2.group(1)
-                return 'href="/attachments/' + aid + '/' + p.replace("attachments/", "", 1) + '"'
-            d["raw_html"] = re.sub(r'src="(attachments/[^"]+)"', rewrite_src, d["raw_html"])
-            d["raw_html"] = re.sub(r'href="(attachments/[^"]+)"', rewrite_href, d["raw_html"])
+                return 'href="/attachments/' + aid + '/' + strip_attachment_prefix(p) + '"'
+            # FORK: these regexes now also match Attachments/StickerCache,
+            # not just a literal lowercase "attachments/" prefix.
+            d["raw_html"] = ATTACHMENT_SRC_RE.sub(rewrite_src, d["raw_html"])
+            d["raw_html"] = ATTACHMENT_HREF_RE.sub(rewrite_href, d["raw_html"])
             # Substitute raw phone numbers with resolved names in sender spans
             def rewrite_sender(m2):
                 return '<span class="sender">' + resolve_sender(m2.group(1)) + '</span>'
@@ -1039,6 +1327,65 @@ def api_reply_parent():
     return jsonify({"parent_id": row["id"], "row": row_num})
 
 
+# ── API: search within one conversation ──────────────────────────────────────
+# FORK addition: reuses the exact same "find message -> look up its row
+# number -> fetch a window centered there -> scroll and highlight" machinery
+# that already powers global search results and reply-arrow navigation
+# (see /api/message_page and fetchRows('initial-row:...') in the frontend
+# below). This endpoint's only job is finding WHICH messages match within
+# one conversation; the frontend does the row lookup + jump itself, exactly
+# like it already does after a global search result click.
+
+@app.route("/api/conversation_search")
+def api_conversation_search():
+    filename = request.args.get("filename", "")
+    query = request.args.get("q", "").strip()
+    if not filename or not query:
+        return jsonify({"results": []})
+
+    conn = get_db()
+    conv = conn.execute("SELECT id FROM conversations WHERE filename=?", (filename,)).fetchone()
+    if not conv:
+        conn.close()
+        return jsonify({"results": []})
+
+    import shlex
+    try:
+        tokens = shlex.split(query)
+    except ValueError:
+        tokens = query.split()
+    terms = ' '.join('"' + t.replace('"', '') + '"*' for t in tokens if t)
+    # Scoped to the text column only (FTS5 column-filter syntax) -- the
+    # messages_fts table also indexes sender, and an unscoped MATCH would
+    # otherwise return messages just because they were SENT BY someone
+    # whose name happens to match the search term, not because their
+    # content does.
+    fts_query = ('text: (' + terms + ')') if terms else ''
+    if not fts_query:
+        conn.close()
+        return jsonify({"results": []})
+
+    try:
+        rows = conn.execute(
+            "SELECT m.id, m.timestamp, "
+            "snippet(messages_fts, 0, '<mark>', '</mark>', '...', 12) as snip "
+            "FROM messages_fts f "
+            "JOIN messages m ON m.rowid = f.rowid "
+            "WHERE messages_fts MATCH ? AND m.conversation_id = ? "
+            "ORDER BY m.timestamp ASC NULLS LAST "
+            "LIMIT 200",
+            (fts_query, conv["id"])
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        conn.close()
+        return jsonify({"error": str(e), "results": []}), 400
+    conn.close()
+
+    return jsonify({"results": [
+        {"id": r["id"], "timestamp": r["timestamp"], "snippet": r["snip"]} for r in rows
+    ]})
+
+
 # ── Search page ───────────────────────────────────────────────────────────────
 
 @app.route("/search")
@@ -1058,13 +1405,18 @@ def search():
 
         # Build FTS query: quote each token and append * for prefix matching.
         # The porter tokenizer handles stemming (run/running/ran), prefix *
-        # handles partial words (taco/tacos/tacobella).
+        # handles partial words (taco/tacos/tacobella). Scoped to the text
+        # column only (FTS5 column-filter syntax) -- messages_fts also
+        # indexes sender, and an unscoped MATCH would otherwise surface
+        # messages just because they were SENT BY someone whose name
+        # matches the search term, not because their content does.
         import shlex
         try:
             tokens = shlex.split(query)
         except ValueError:
             tokens = query.split()
-        fts_query = ' '.join('"' + t.replace('"', '') + '"*' for t in tokens if t)
+        terms = ' '.join('"' + t.replace('"', '') + '"*' for t in tokens if t)
+        fts_query = 'text: (' + terms + ')'
 
         rows = conn.execute(
             "SELECT m.id, m.timestamp, m.sender, m.text, c.filename, c.name, "
@@ -1122,14 +1474,16 @@ def search():
         '<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💬</text></svg>">'
         '<title>Search: ' + query + '</title><style>' + CSS + '</style></head><body>'
         '<div class="header">'
-        '<h1>&#128172;</h1>'
+        '<h1><a href="/">&#128172;</a></h1>'
         '<div class="search-bar">'
+        '<div class="search-input-wrap">'
         '<input type="text" id="searchInput" placeholder="Search messages..." value="' + query.replace('"','&quot;') + '"'
-        ' onkeydown="if(event.key===\'Enter\')doSearch()">'
-        '<button onclick="doSearch()" class="primary">Messages</button>'
-        '<button onclick="doImageSearch()" class="img-btn">Images</button>'
+        ' onkeydown="if(event.key===\'Enter\')setSearchMode(searchMode)">'
+        '<button type="button" class="search-input-clear" onclick="clearMainSearch()" title="Clear" tabindex="-1">&times;</button>'
         '</div>'
-        '<div class="nav"><a href="/">Conversations</a></div>'
+        '<button id="modeMessagesBtn" class="active" onclick="setSearchMode(\'messages\')">Messages</button>'
+        '<button id="modeImagesBtn" onclick="setSearchMode(\'images\')">Images</button>'
+        '</div>'
         '</div>'
         '<div class="main"><div class="results-pane">'
         + sort_bar +
@@ -1137,10 +1491,19 @@ def search():
         + results_html +
         '</div></div>'
         '<script>'
-        'function doSearch(){var q=document.getElementById("searchInput").value.trim();'
-        'if(q)window.location.href="/search?q="+encodeURIComponent(q);}'
-        'function doImageSearch(){var q=document.getElementById("searchInput").value.trim();'
-        'window.location.href=q?"/search/images?q="+encodeURIComponent(q):"/search/images";}'
+        'var searchMode = "messages";'
+        'function setSearchMode(mode){'
+        'searchMode=mode;'
+        'var msgBtn=document.getElementById("modeMessagesBtn"),imgBtn=document.getElementById("modeImagesBtn");'
+        'if(msgBtn)msgBtn.classList.toggle("active",mode==="messages");'
+        'if(imgBtn)imgBtn.classList.toggle("active",mode==="images");'
+        'var q=document.getElementById("searchInput").value.trim();'
+        'if(!q)return;'
+        'window.location.href=(mode==="messages"?"/search?q=":"/search/images?q=")+encodeURIComponent(q);}'
+        'function clearMainSearch(){'
+        'var input=document.getElementById("searchInput");'
+        'input.value="";'
+        'window.location.href="/";}'
         '</script>'
         '</body></html>'
     )
@@ -1154,6 +1517,15 @@ def search_images():
     from urllib.parse import quote as _q
 
     query    = request.args.get("q", "").strip()
+
+    # No query means there's nothing to rank images against -- rather than
+    # showing an "enter a query" landing page, just send this back to the
+    # conversation view. The frontend's setSearchMode() already avoids
+    # navigating here at all when the search box is empty; this redirect
+    # covers the remaining paths (bookmarks, back/forward, typed URLs).
+    if not query:
+        return redirect('/')
+
     page     = max(1, int(request.args.get("page", 1)))
     per_page = min(200, max(20, int(request.args.get("per_page", 100))))
 
@@ -1164,9 +1536,7 @@ def search_images():
     count_embedded = conn.execute("SELECT COUNT(*) FROM image_embeddings").fetchone()[0]
     conn.close()
 
-    if not query:
-        status_msg = "Enter a query to search your images"
-    elif count_embedded == 0:
+    if count_embedded == 0:
         status_msg = ("Image embeddings not yet available. "
                       "The indexer is still processing images in the background — "
                       "check back later.")
@@ -1189,9 +1559,11 @@ def search_images():
                 for idx in sorted_idx:
                     r = meta[idx]
                     all_results.append({
+                        # FORK: strip_attachment_prefix() instead of a literal
+                        # .replace('attachments/', '', 1).
                         'att_url':    "/attachments/{}/{}".format(
                                           r['archive_id'],
-                                          r['attachment_path'].replace('attachments/', '', 1)),
+                                          strip_attachment_prefix(r['attachment_path'])),
                         'conv_name':  r['name'] or '',
                         'filename':   r['filename'] or '',
                         'timestamp':  r['timestamp'] or '',
@@ -1273,24 +1645,35 @@ def search_images():
         '<title>Image Search: ' + query + '</title>'
         '<style>' + CSS + '</style></head><body>'
         '<div class="header">'
-        '<h1>&#128172;</h1>'
+        '<h1><a href="/">&#128172;</a></h1>'
         '<div class="search-bar">'
+        '<div class="search-input-wrap">'
         '<input type="text" id="searchInput" placeholder="Search images..." value="'
         + query.replace('"', '&quot;') +
-        '" onkeydown="if(event.key===\'Enter\')doImageSearch()">'
-        '<button onclick="doSearch()">Messages</button>'
-        '<button onclick="doImageSearch()" class="img-btn active">Images</button>'
+        '" onkeydown="if(event.key===\'Enter\')setSearchMode(searchMode)">'
+        '<button type="button" class="search-input-clear" onclick="clearMainSearch()" title="Clear" tabindex="-1">&times;</button>'
         '</div>'
-        '<div class="nav"><a href="/">Conversations</a></div>'
+        '<button id="modeMessagesBtn" onclick="setSearchMode(\'messages\')">Messages</button>'
+        '<button id="modeImagesBtn" class="active" onclick="setSearchMode(\'images\')">Images</button>'
+        '</div>'
         '</div>'
         '<div class="main"><div class="results-pane">'
         + body_html +
         '</div></div>'
         '<script>'
-        'function doSearch(){var q=document.getElementById("searchInput").value.trim();'
-        'if(q)window.location.href="/search?q="+encodeURIComponent(q);}'
-        'function doImageSearch(){var q=document.getElementById("searchInput").value.trim();'
-        'window.location.href=q?"/search/images?q="+encodeURIComponent(q):"/search/images";}'
+        'var searchMode = "images";'
+        'function setSearchMode(mode){'
+        'searchMode=mode;'
+        'var msgBtn=document.getElementById("modeMessagesBtn"),imgBtn=document.getElementById("modeImagesBtn");'
+        'if(msgBtn)msgBtn.classList.toggle("active",mode==="messages");'
+        'if(imgBtn)imgBtn.classList.toggle("active",mode==="images");'
+        'var q=document.getElementById("searchInput").value.trim();'
+        'if(!q)return;'
+        'window.location.href=(mode==="messages"?"/search?q=":"/search/images?q=")+encodeURIComponent(q);}'
+        'function clearMainSearch(){'
+        'var input=document.getElementById("searchInput");'
+        'input.value="";'
+        'window.location.href="/";}'
         '</script>'
         '</body></html>'
     )
@@ -1334,8 +1717,12 @@ def serve_attachment(archive_id, filepath):
     conn.close()
     if not row:
         abort(404)
-    full_path = Path(row["path"]) / "attachments" / filepath
-    if not full_path.exists() or not full_path.is_file():
+    # FORK: check every recognized attachment-folder name instead of only
+    # the literal "attachments" -- see the ATTACHMENT_DIR_NAMES comment
+    # near the top of this file for why.
+    candidates = [Path(row["path"]) / name / filepath for name in ATTACHMENT_DIR_NAMES]
+    full_path = next((c for c in candidates if c.is_file()), None)
+    if full_path is None:
         abort(404)
 
     suffix = full_path.suffix
