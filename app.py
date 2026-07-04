@@ -2002,8 +2002,15 @@ def serve_attachment(archive_id, filepath):
         abort(404)
     # FORK: check every recognized attachment-folder name instead of only
     # the literal "attachments" -- see the ATTACHMENT_DIR_NAMES comment
-    # near the top of this file for why.
+    # near the top of this file for why. Also falls back to a shared
+    # attachments folder at ARCHIVE_ROOT if this specific archive doesn't
+    # have its own -- supports a layout where attachments are kept in one
+    # folder outside imessage-exporter's own control (e.g. an independent
+    # rsync from the live Messages Attachments folder), with multiple
+    # separate export runs referencing back into it rather than each one
+    # copying its own.
     candidates = [Path(row["path"]) / name / filepath for name in ATTACHMENT_DIR_NAMES]
+    candidates += [Path(ARCHIVE_ROOT) / name / filepath for name in ATTACHMENT_DIR_NAMES]
     full_path = next((c for c in candidates if c.is_file()), None)
     if full_path is None:
         abort(404)
