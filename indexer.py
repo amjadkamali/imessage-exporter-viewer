@@ -963,6 +963,9 @@ def build_handle_map(ab_paths):
     return handle_map
 
 
+NAMED_GROUP_SUFFIX_RE = re.compile(r'^(.+?)\s*-\s*(\d+)$')
+
+
 def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
     """
     (Re)build contact_groups / conversation_contact_group from the Address
@@ -983,10 +986,15 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
          correctly matches an identical later export of that same
          unresolved handle, just won't survive that specific person's
          handle changing later (the same known limitation as case 1).
-    Named groups (no commas at all) are untouched by any of this --
+    Named groups (no commas at all) are mostly untouched by any of this --
     there's no handle information in a named group's filename to resolve
-    or match by, so they continue to be matched only by exact filename,
-    same as before this feature existed.
+    or match by, so they continue to be matched only by exact filename --
+    EXCEPT for one specific, narrow case: two named groups whose stems are
+    identical except for a trailing " - <number>" imessage-exporter itself
+    appended to keep filenames unique (see the collision-detection block
+    below for why this signals the same real-world group split across two
+    internal chat rooms, and why it's only trusted as such when a genuine
+    collision exists to explain it).
     Wipes and rebuilds every time so a renamed contact or an updated
     cache take effect immediately, without touching conversations or
     messages at all -- if the cache is stale or missing entirely, this
@@ -996,13 +1004,36 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
     """
     ab_paths = get_addressbook_cache_paths(cache_dir)
     if not ab_paths:
-        print(f"No address book cache found at {cache_dir}; contact grouping skipped.")
-        return 0
-    handle_map = build_handle_map(ab_paths)
-    if not handle_map:
-        return 0
+        print(f"No address book cache found at {cache_dir}; handle-based contact grouping skipped "
+              f"(named-group name-collision merging, which doesn't need it, still runs).")
+    handle_map = build_handle_map(ab_paths) if ab_paths else {}
 
     my_handles_norm = frozenset(norm_handle(h) for h in MY_HANDLES.split() if h.strip())
+
+    # Named-group collision detection: imessage-exporter appends " - <N>"
+    # to a group's filename when its custom display_name collides with a
+    # DIFFERENT internal chat_identifier that happens to share the exact
+    # same name -- a real, documented scenario (macOS's own `chat` table
+    # can have multiple rows sharing one display_name with different
+    # chat_identifier values, typically from the same real-world group
+    # getting split into a new internal chat room after a participant
+    # change, an SMS/iMessage transition, or a sync quirk). That can't be
+    # told apart from a coincidental, genuinely-unrelated name collision
+    # by filename alone, so this only merges when there's an ACTUAL
+    # collision to resolve -- 2+ files sharing the identical stripped
+    # name -- never touching a standalone named group that happens to end
+    # in a number for some other reason (e.g. "Top 10 - 2024"): there's
+    # nothing to disambiguate for a name nothing else shares, so it's left
+    # exactly as it already was, matched only by exact filename.
+    prefix_counts = {}
+    for row in conn.execute("SELECT filename FROM conversations").fetchall():
+        stem = Path(row["filename"]).stem
+        if "," in stem:
+            continue
+        m = NAMED_GROUP_SUFFIX_RE.match(stem)
+        if m:
+            prefix_counts[m.group(1)] = prefix_counts.get(m.group(1), 0) + 1
+    colliding_name_prefixes = {p for p, c in prefix_counts.items() if c >= 2}
 
     conn.execute("DELETE FROM conversation_contact_group")
     conn.execute("DELETE FROM contact_groups")
@@ -1041,10 +1072,17 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
                 display_name = ", ".join(sorted(names))
                 group_matched += 1
         else:
-            person = handle_map.get(norm_handle(stem))
-            if not person:
-                continue
-            contact_key, display_name = person
+            m = NAMED_GROUP_SUFFIX_RE.match(stem)
+            if m and m.group(1) in colliding_name_prefixes:
+                # A genuine collision exists for this exact stripped name
+                # -- treat all of them as the same real-world group.
+                contact_key = "namedgroup:" + m.group(1)
+                display_name = m.group(1)
+            else:
+                person = handle_map.get(norm_handle(stem))
+                if not person:
+                    continue
+                contact_key, display_name = person
 
         conn.execute(
             "INSERT OR IGNORE INTO contact_groups (contact_key, display_name) VALUES (?,?)",
