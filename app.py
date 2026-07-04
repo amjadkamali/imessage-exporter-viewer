@@ -1332,8 +1332,8 @@ function renderConvInfo(data) {
 
   var html = '<div class="conv-info-name">' + esc(data.display_name || '') + '</div>';
 
-  html += '<div class="conv-info-section-label">Participants</div>';
   if (data.participants && data.participants.length) {
+    html += '<div class="conv-info-section-label">Participants</div>';
     data.participants.forEach(function(p) {
       html += '<div class="conv-info-participant">';
       if (p.name) {
@@ -1351,11 +1351,12 @@ function renderConvInfo(data) {
       }
       html += '</div>';
     });
-  } else if (data.is_named_group) {
-    html += '';
-  } else {
-    html += '<div class="conv-info-empty">No participant details available.</div>';
   }
+  // When there's no participant data at all, the whole section (label
+  // included) is simply omitted rather than shown with an explanatory
+  // placeholder -- nothing useful to tell the person here beyond "there's
+  // nothing here," and the underlying-files section below still confirms
+  // what's actually being viewed regardless.
 
   html += '<div class="conv-info-section-label">Underlying file' + (data.underlying_files.length > 1 ? 's' : '') + '</div>';
   data.underlying_files.forEach(function(f) {

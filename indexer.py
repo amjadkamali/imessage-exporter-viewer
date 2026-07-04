@@ -537,13 +537,14 @@ def init_db(conn):
 
     -- FORK addition: real participant handles for a group chat, extracted
     -- from chat.db's own chat_handle_join table (imessage-exporter's
-    -- filenames carry none for a named group) -- see
-    -- populate_raw_participants(). Purely descriptive/display data, never
-    -- used to decide which conversations merge into one: chat_handle_join
-    -- reflects CURRENT membership only, and people get added to or
-    -- removed from a real group over time, so two exports of the same
-    -- ongoing group can legitimately disagree here without being any
-    -- less the same conversation.
+    -- filenames carry none for a named group, and only an unreliable
+    -- auto-generated guess for a "guessed name" group) -- see
+    -- populate_raw_participants(). Purely descriptive/display data by
+    -- default; ALSO consulted (not required, just consulted) by
+    -- populate_contact_groups() for two things built on top of it: a
+    -- named-group collision sanity check, and resolved participant-set
+    -- matching for guessed-name groups -- see those sections there for
+    -- exactly what each does and doesn't require.
     CREATE TABLE IF NOT EXISTS conversation_raw_participants (
         conversation_id INTEGER NOT NULL REFERENCES conversations(id),
         handle TEXT NOT NULL,
@@ -982,6 +983,26 @@ def build_handle_map(ab_paths):
 NAMED_GROUP_SUFFIX_RE = re.compile(r'^(.+?)\s*-\s*(\d+)$')
 
 
+def _raw_participant_sets(conn):
+    """
+    Return {conversation_id: set(normalized handles)} for every
+    conversation that has ANY rows in conversation_raw_participants.
+    Normalized (not raw) so a real overlap isn't missed just because two
+    exports formatted the same phone number slightly differently, and so
+    this can be compared directly against handle_map's own normalized
+    keys for guessed-name participant-set matching.
+    Deliberately returns nothing for a conversation with no rows at all,
+    rather than an empty set -- see how this is used in
+    populate_contact_groups()'s named-group collision check, where "no
+    data" and "confirmed zero members" need to be treated differently:
+    the former can't be used to rule a merge out, the latter can.
+    """
+    result = {}
+    for row in conn.execute("SELECT conversation_id, handle FROM conversation_raw_participants"):
+        result.setdefault(row["conversation_id"], set()).add(norm_handle(row["handle"]))
+    return result
+
+
 def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
     """
     (Re)build contact_groups / conversation_contact_group from the Address
@@ -1005,12 +1026,39 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
     Named groups (no commas at all) are mostly untouched by any of this --
     there's no handle information in a named group's filename to resolve
     or match by, so they continue to be matched only by exact filename --
-    EXCEPT for one specific, narrow case: two named groups whose stems are
-    identical except for a trailing " - <number>" imessage-exporter itself
-    appended to keep filenames unique (see the collision-detection block
-    below for why this signals the same real-world group split across two
-    internal chat rooms, and why it's only trusted as such when a genuine
-    collision exists to explain it).
+    EXCEPT for one specific, narrow case: two or more named groups whose
+    stems are identical except for a trailing " - <number>"
+    imessage-exporter itself appended to keep filenames unique (see the
+    collision-detection block below for why this signals the same
+    real-world group split across two internal chat rooms far more often
+    than it signals two coincidentally-same-named but genuinely unrelated
+    groups). Since a name collision alone can't fully rule out the
+    latter, real participant data (see conversation_raw_participants /
+    populate_raw_participants()) is consulted as a sanity check where
+    available: candidates sharing a name are only actually merged
+    together if they share at least ONE known member in common. This is
+    deliberately NOT a strict requirement that their full membership
+    matches -- real groups gain and lose members over time without
+    becoming a different conversation, so demanding total agreement would
+    incorrectly split an ordinary, still-ongoing group the moment
+    anyone's membership ever changed. It's also deliberately NOT enforced
+    at all for a candidate with no participant data on file yet (chat.db
+    had no matching GUID to correlate against for it) -- absence of data
+    is not evidence of disjoint membership, so that candidate falls back
+    to the plain name-based match rather than being excluded on no real
+    basis. Only candidates where BOTH have known, disjoint member sets
+    get split apart from each other.
+    Separately, an auto-generated "guessed name" group (e.g. "John, Jane
+    & 3 others.html" -- see looks_like_guessed_name()) is now ALSO
+    eligible for the same resolved participant-set matching an ordinary
+    comma-separated group gets, using conversation_raw_participants as
+    its source of participants instead of its own unreliable filename
+    summary. This is what lets a guessed-name file merge with another
+    guessed-name file, or with an ordinary comma-separated file, that
+    resolves to the exact same contacts -- something that was previously
+    impossible, since a guessed-name filename was never parsed for
+    participants at all. A guessed-name file with no sidecar data on file
+    falls back to matching only by exact filename, same as always.
     Wipes and rebuilds every time so a renamed contact or an updated
     cache take effect immediately, without touching conversations or
     messages at all -- if the cache is stale or missing entirely, this
@@ -1035,21 +1083,104 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
     # getting split into a new internal chat room after a participant
     # change, an SMS/iMessage transition, or a sync quirk). That can't be
     # told apart from a coincidental, genuinely-unrelated name collision
-    # by filename alone, so this only merges when there's an ACTUAL
-    # collision to resolve -- 2+ files sharing the identical stripped
-    # name -- never touching a standalone named group that happens to end
-    # in a number for some other reason (e.g. "Top 10 - 2024"): there's
-    # nothing to disambiguate for a name nothing else shares, so it's left
-    # exactly as it already was, matched only by exact filename.
-    prefix_counts = {}
-    for row in conn.execute("SELECT filename FROM conversations").fetchall():
-        stem = Path(row["filename"]).stem
+    # by filename alone, so this block gathers, for every stripped name
+    # shared by 2+ named-group filenames, which of those candidates
+    # should actually be merged together -- via connected components over
+    # "shares at least one known member", not just grouped by name
+    # directly. See the docstring above for the full reasoning.
+    raw_sets = _raw_participant_sets(conn)
+
+    id_by_filename = {r["filename"]: r["id"] for r in conn.execute("SELECT id, filename FROM conversations")}
+
+    prefix_to_ids = {}
+    for filename, conv_id in id_by_filename.items():
+        stem = Path(filename).stem
         if "," in stem:
             continue
         m = NAMED_GROUP_SUFFIX_RE.match(stem)
         if m:
-            prefix_counts[m.group(1)] = prefix_counts.get(m.group(1), 0) + 1
-    colliding_name_prefixes = {p for p, c in prefix_counts.items() if c >= 2}
+            prefix_to_ids.setdefault(m.group(1), []).append(conv_id)
+
+    # union-find over conversation_ids sharing a prefix
+    parent = {}
+
+    def find(x):
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    named_group_component = {}  # conv_id -> (prefix, component_root), only for 2+ member components
+    for prefix, ids in prefix_to_ids.items():
+        if len(ids) < 2:
+            continue
+
+        known_ids = [cid for cid in ids if raw_sets.get(cid) is not None]
+        unknown_ids = [cid for cid in ids if raw_sets.get(cid) is None]
+
+        # Build overlap-based clusters ONLY among candidates with known
+        # participant data first. This matters: if a no-data candidate
+        # were unioned in during this same pass, union-find's own
+        # transitivity would let it silently bridge two OTHERWISE PROVEN
+        # DISJOINT clusters into one (no-data candidate X "can't rule out"
+        # joining known cluster A, and separately "can't rule out" joining
+        # known cluster B, would transitively merge A and B together even
+        # though A and B themselves have confirmed, zero-overlap
+        # membership) -- confirmed directly: an earlier version of this
+        # check did exactly that when tested against three groups sharing
+        # a name, two of which genuinely overlapped and one of which was
+        # a completely disjoint, unrelated group, plus a fourth with no
+        # participant data on file. The no-data candidate silently pulled
+        # the disjoint group into the same merge purely by transitivity.
+        for cid in known_ids:
+            parent.setdefault(cid, cid)
+        for i in range(len(known_ids)):
+            for j in range(i + 1, len(known_ids)):
+                a, b = known_ids[i], known_ids[j]
+                if raw_sets[a] & raw_sets[b]:
+                    union(a, b)
+
+        known_components = {}
+        for cid in known_ids:
+            known_components.setdefault(find(cid), []).append(cid)
+
+        if not known_ids:
+            # No evidence at all for this prefix -- nothing to weigh a
+            # merge against, so fall back entirely to the plain
+            # name-based match this check didn't used to make any
+            # exception to.
+            for cid in ids:
+                parent.setdefault(cid, cid)
+            for i in range(1, len(ids)):
+                union(ids[0], ids[i])
+        elif len(known_components) == 1:
+            # Exactly one plausible group under this name -- a no-data
+            # candidate can't be ruled out against it, so it joins that
+            # one cluster.
+            only_root = next(iter(known_components))
+            for cid in unknown_ids:
+                parent.setdefault(cid, cid)
+                union(cid, only_root)
+        else:
+            # Multiple, mutually-disjoint known clusters share this name
+            # -- a no-data candidate has no real basis to be assigned to
+            # one over another, so it's left standalone rather than
+            # guessed at.
+            for cid in unknown_ids:
+                parent.setdefault(cid, cid)
+
+        components = {}
+        for cid in ids:
+            components.setdefault(find(cid), []).append(cid)
+        for root, members in components.items():
+            if len(members) >= 2:
+                for cid in members:
+                    named_group_component[cid] = (prefix, root)
 
     conn.execute("DELETE FROM conversation_contact_group")
     conn.execute("DELETE FROM contact_groups")
@@ -1058,7 +1189,8 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
     group_matched = 0
     for row in conn.execute("SELECT id, filename FROM conversations").fetchall():
         stem = Path(row["filename"]).stem
-        if "," in stem:
+        is_guessed = looks_like_guessed_name(stem)
+        if "," in stem and not is_guessed:
             participants = effective_group_participants(row["filename"], my_handles_norm)
             if not participants:
                 continue
@@ -1087,13 +1219,63 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
                 contact_key = "group:" + "|".join(sorted(identities))
                 display_name = ", ".join(sorted(names))
                 group_matched += 1
+        elif is_guessed:
+            # A "guessed name" group (e.g. "John, Jane & 3 others.html")
+            # has an auto-generated, unreliable summary as its filename --
+            # never parsed as real participant data (see
+            # looks_like_guessed_name()), so it's historically only ever
+            # matched by exact filename. conversation_raw_participants
+            # (from the sync pipeline's chat.db-derived sidecar -- see
+            # populate_raw_participants()) now gives real membership for
+            # exactly this kind of file when the sidecar has it, so THAT
+            # is used here instead of the filename -- same "group:"
+            # resolved-identity contact_key as an ordinary comma-separated
+            # group, just sourced from real chat.db data rather than
+            # parsed from the filename. This is what lets a guessed-name
+            # file merge with another guessed-name file, OR with an
+            # ordinary comma-separated file, that resolves to the exact
+            # same contacts. No sidecar data at all for this file -> falls
+            # through to matching only by exact filename, same as always.
+            norm_participants = raw_sets.get(row["id"])
+            if not norm_participants:
+                continue
+            stripped = norm_participants - my_handles_norm
+            norm_participants = stripped if stripped else norm_participants
+            if len(norm_participants) == 1:
+                only = next(iter(norm_participants))
+                person = handle_map.get(only)
+                if not person:
+                    continue
+                contact_key, display_name = person
+            else:
+                identities = set()
+                names = set()
+                for norm_p in norm_participants:
+                    person = handle_map.get(norm_p)
+                    if person:
+                        identities.add(person[0])
+                        names.add(person[1])
+                    else:
+                        identities.add("unresolved:" + norm_p)
+                        names.add(norm_p)
+                if len(identities) < 2:
+                    continue
+                contact_key = "group:" + "|".join(sorted(identities))
+                display_name = ", ".join(sorted(names))
+                group_matched += 1
         else:
-            m = NAMED_GROUP_SUFFIX_RE.match(stem)
-            if m and m.group(1) in colliding_name_prefixes:
+            comp = named_group_component.get(row["id"])
+            if comp:
                 # A genuine collision exists for this exact stripped name
-                # -- treat all of them as the same real-world group.
-                contact_key = "namedgroup:" + m.group(1)
-                display_name = m.group(1)
+                # -- treat all of them as the same real-world group. root
+                # is a conversation_id; namespacing the key by it keeps
+                # two DIFFERENT, non-overlapping components that happen to
+                # share the same stripped name (the exact case this check
+                # exists to catch) from colliding into the same
+                # contact_key.
+                prefix, root = comp
+                contact_key = f"namedgroup:{prefix}#{root}"
+                display_name = prefix
             else:
                 person = handle_map.get(norm_handle(stem))
                 if not person:
@@ -1130,6 +1312,11 @@ def populate_raw_participants(conn):
     against), that archive's named groups just have no participant data,
     the same graceful degradation as everywhere else this project reads
     optional sidecar data.
+    Runs BEFORE populate_contact_groups() (see run_indexer()) specifically
+    so that function's own named-group collision check, and its
+    guessed-name participant-set matching, both have this run's freshly
+    rebuilt participant data available to consult, rather than whatever
+    was left over from the previous indexing pass.
     """
     conn.execute("DELETE FROM conversation_raw_participants")
 
@@ -1234,8 +1421,8 @@ def run_indexer():
     print(f"\nDone: {archs} archives, {convs} conversations, {msgs:,} messages")
 
     print()
-    populate_contact_groups(conn)
     populate_raw_participants(conn)
+    populate_contact_groups(conn)
 
     conn.close()
 
