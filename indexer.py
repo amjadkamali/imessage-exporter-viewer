@@ -767,17 +767,41 @@ def strip_self_handles(participants, my_handles_norm):
     return filtered if filtered else participants
 
 
+GUESSED_NAME_RE = re.compile(r'\d+\s+others?\b', re.IGNORECASE)
+
+def looks_like_guessed_name(stem):
+    """
+    macOS/imessage-exporter sometimes names a chat using an auto-generated
+    summary like "John, Jane & 3 others" when the group has no custom
+    name set. That summary is itself a guess about membership -- not a
+    stable identifier -- so treating it as a comma-separated handle list
+    would mean trying to look up nonsense like "John" or "Jane & 3
+    others" as if they were phone numbers or emails. Harmless in
+    practice (they simply won't resolve), but wasted work, and not
+    impossible in principle for one to accidentally collide with some
+    unrelated real handle. Files with this kind of name still merge with
+    each other via the ordinary exact-filename match every conversation
+    already gets (see conversations.filename's UNIQUE constraint) --
+    they just never become eligible for the participant-set matching
+    effective_group_participants() enables for genuine handle-based
+    groups. Ported directly from merge_by_contact.py's function of the
+    same name and same purpose.
+    """
+    return bool(GUESSED_NAME_RE.search(stem))
+
+
 def effective_group_participants(filename, my_handles_norm):
     """
     For a comma-separated group filename, return the participant list
     after stripping any of your own handles that snuck in via the
     glitch strip_self_handles() guards against. Returns None for named
     groups (e.g. "Book Club - 5.html" -- no individual handles are
-    encoded in a named group's filename to strip in the first place) and
-    for non-group filenames.
+    encoded in a named group's filename to strip in the first place),
+    auto-generated "guessed name" groups (see looks_like_guessed_name()),
+    and non-group filenames.
     """
     stem = Path(filename).stem
-    if ',' not in stem:
+    if ',' not in stem or looks_like_guessed_name(stem):
         return None
     participants = [p.strip() for p in stem.split(',') if p.strip()]
     return strip_self_handles(participants, my_handles_norm)
