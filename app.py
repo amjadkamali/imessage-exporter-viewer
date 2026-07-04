@@ -24,6 +24,17 @@ from pathlib import Path
 from urllib.parse import quote
 from flask import Flask, request, jsonify, Response, redirect
 
+# Reused rather than duplicated: indexer.py already has well-tested Address
+# Book reading and participant-parsing logic (build_handle_map,
+# effective_group_participants, norm_handle, etc). Both files run from the
+# same container working directory, so this is a plain local import, not a
+# packaged dependency -- see the bottom of indexer.py for the __main__
+# guard that keeps this import side-effect-free.
+from indexer import (
+    build_handle_map, get_addressbook_cache_paths, norm_handle,
+    effective_group_participants, MY_HANDLES, ADDRESSBOOK_CACHE_DIR,
+)
+
 DB_PATH      = os.environ.get("DB_PATH", "/data/imessage.db")
 ARCHIVE_ROOT = os.environ.get("ARCHIVE_ROOT", "/archives")
 MODEL_DIR    = os.environ.get("MODEL_DIR", "/data/models")
@@ -219,6 +230,26 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 .date-jump select { background: #3a3a3c; border: none; border-radius: 8px;
   padding: 4px 8px; color: #f2f2f7; font-size: 12px; outline: none; cursor: pointer; }
 .date-jump .btn { margin-left: auto; }
+.conv-info-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+  z-index: 100; align-items: center; justify-content: center; }
+.conv-info-modal { background: #2c2c2e; border-radius: 14px; width: 340px; max-width: 90vw;
+  max-height: 80vh; display: flex; flex-direction: column; overflow: hidden; }
+.conv-info-header { padding: 14px 16px; border-bottom: 1px solid #3a3a3c;
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+.conv-info-header span { font-size: 15px; font-weight: 600; }
+.conv-info-body { padding: 14px 16px; overflow-y: auto; }
+.conv-info-name { font-size: 17px; font-weight: 600; margin-bottom: 12px; }
+.conv-info-section-label { font-size: 11px; color: #8e8e93; text-transform: uppercase;
+  letter-spacing: 0.5px; margin: 14px 0 6px; }
+.conv-info-section-label:first-child { margin-top: 0; }
+.conv-info-participant { display: flex; justify-content: space-between; align-items: baseline;
+  gap: 10px; padding: 6px 0; border-bottom: 1px solid #3a3a3c33; }
+.conv-info-participant:last-child { border-bottom: none; }
+.conv-info-participant-name { font-size: 14px; }
+.conv-info-participant-handle { font-size: 12px; color: #8e8e93; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.conv-info-file { font-size: 12px; color: #8e8e93; padding: 3px 0; word-break: break-word; }
+.conv-info-empty { font-size: 13px; color: #8e8e93; font-style: italic; }
 .msg-highlight { outline: 2px solid #ffd60a !important; border-radius: 20px !important; outline-offset: 3px !important; }
 .results-pane { flex: 1; overflow-y: auto; padding: 16px; }
 .sort-bar { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; }
@@ -562,6 +593,7 @@ def index():
       <div class="page-controls">
         <button class="btn" id="convSearchToggleBtn" onclick="toggleConvSearch()" title="Search this conversation">&#128269;</button>
         <button class="btn" id="attachmentsViewerToggleBtn" onclick="toggleAttachmentsViewer()" title="View all photos & videos">&#128247;</button>
+        <button class="btn" id="convInfoToggleBtn" onclick="openConvInfo()" title="Contact info">&#8505;&#65039;</button>
         <button class="btn" id="dateJumpToggleBtn" onclick="toggleDateJump()" title="Jump to date" disabled>&#128197;</button>
         <button class="btn" id="jumpTopBtn" onclick="jumpToTop()" title="Jump to top">&#8607;</button>
         <button class="btn" id="jumpBottomBtn" onclick="jumpToBottom()" title="Jump to bottom">&#8609;</button>
@@ -605,6 +637,15 @@ def index():
       <div class="attachments-grid" id="attachmentsGrid"></div>
     </div>
     <div class="loading-bar" id="loadingBar" style="display:none">Loading...</div>
+  </div>
+</div>
+<div class="conv-info-overlay" id="convInfoOverlay" onclick="if(event.target===this)closeConvInfo()">
+  <div class="conv-info-modal">
+    <div class="conv-info-header">
+      <span>Conversation Info</span>
+      <button class="btn" onclick="closeConvInfo()" title="Close">&times;</button>
+    </div>
+    <div class="conv-info-body" id="convInfoBody"></div>
   </div>
 </div>
 <script>
@@ -1265,6 +1306,61 @@ function closeDateJump() {
   document.getElementById('dateJump').style.display = 'none';
 }
 
+function openConvInfo() {
+  if (!currentFn) return;
+  var overlay = document.getElementById('convInfoOverlay');
+  var body = document.getElementById('convInfoBody');
+  body.innerHTML = '<div class="conv-info-empty">Loading&hellip;</div>';
+  overlay.style.display = 'flex';
+  fetch('/api/conversation_info?filename=' + encodeURIComponent(currentFn))
+    .then(function(r) { return r.json(); })
+    .then(renderConvInfo)
+    .catch(function() {
+      body.innerHTML = '<div class="conv-info-empty">Couldn\\'t load conversation info.</div>';
+    });
+}
+
+function closeConvInfo() {
+  document.getElementById('convInfoOverlay').style.display = 'none';
+}
+
+function renderConvInfo(data) {
+  var body = document.getElementById('convInfoBody');
+  if (data.error) {
+    body.innerHTML = '<div class="conv-info-empty">Couldn\\'t load conversation info.</div>';
+    return;
+  }
+
+  var html = '<div class="conv-info-name">' + esc(data.display_name || '') + '</div>';
+
+  html += '<div class="conv-info-section-label">Participants</div>';
+  if (data.participants && data.participants.length) {
+    data.participants.forEach(function(p) {
+      if (p.name) {
+        html += '<div class="conv-info-participant">'
+              + '<span class="conv-info-participant-name">' + esc(p.name) + '</span>'
+              + '<span class="conv-info-participant-handle">' + esc(p.handle) + '</span>'
+              + '</div>';
+      } else {
+        html += '<div class="conv-info-participant">'
+              + '<span class="conv-info-participant-name">' + esc(p.handle) + '</span>'
+              + '</div>';
+      }
+    });
+  } else if (data.is_named_group) {
+    html += '<div class="conv-info-empty">Named group -- no participant handles in the export filename.</div>';
+  } else {
+    html += '<div class="conv-info-empty">No participant details available.</div>';
+  }
+
+  html += '<div class="conv-info-section-label">Underlying file' + (data.underlying_files.length > 1 ? 's' : '') + '</div>';
+  data.underlying_files.forEach(function(f) {
+    html += '<div class="conv-info-file">' + esc(f) + '</div>';
+  });
+
+  body.innerHTML = html;
+}
+
 function updateDateJump(firstDate, lastDate) {
   if (!firstDate || !lastDate) return;
 
@@ -1666,6 +1762,86 @@ def api_message_page():
     conn.close()
     page = max(1, (row_num + per_page - 1) // per_page)
     return jsonify({"page": page, "highlight_ts": timestamp, "row": row_num})
+
+
+# ── API: contact/group info for the conversation being viewed ───────────────
+
+@app.route("/api/conversation_info")
+def api_conversation_info():
+    """
+    Surfaces what's actually behind the currently-viewed conversation:
+    its resolved participants (with Address Book names where known), and
+    every real underlying .html file merged into it. The second part
+    matters more here than it might for other endpoints -- this project
+    now has THREE separate, independent mechanisms that can merge several
+    files into one conversation (disguised-1:1 collapse, resolved
+    participant-set matching, and named-group name-collision matching),
+    and the last of those in particular can't fully rule out two
+    genuinely unrelated groups that just happen to share a name. Showing
+    the underlying files plainly gives a direct way to notice and catch
+    that, rather than trusting a merge silently.
+    Participants are recomputed here on demand from the underlying
+    filenames rather than read from contact_groups, which only stores the
+    single, already-combined display_name for a group -- not its
+    individual participant breakdown -- so this mirrors
+    populate_contact_groups()'s own per-file parsing logic directly.
+    """
+    filename = request.args.get("filename", "")
+    conn = get_db()
+    conv_ids = resolve_conversation_ids(conn, filename)
+    if not conv_ids:
+        conn.close()
+        return jsonify({"error": "Not found"}), 404
+
+    placeholders = ",".join("?" * len(conv_ids))
+    rows = conn.execute(
+        "SELECT id, filename, name FROM conversations WHERE id IN (%s)" % placeholders, conv_ids
+    ).fetchall()
+    underlying_files = sorted((r["filename"] for r in rows))
+
+    contact_key_row = conn.execute(
+        "SELECT contact_key FROM conversation_contact_group WHERE conversation_id=?", (conv_ids[0],)
+    ).fetchone()
+    if contact_key_row:
+        display = conn.execute(
+            "SELECT display_name FROM contact_groups WHERE contact_key=?", (contact_key_row["contact_key"],)
+        ).fetchone()
+        display_name = display["display_name"] if display else rows[0]["name"]
+    else:
+        display_name = rows[0]["name"]
+    conn.close()
+
+    my_handles_norm = frozenset(norm_handle(h) for h in MY_HANDLES.split() if h.strip())
+    handle_map = build_handle_map(get_addressbook_cache_paths(ADDRESSBOOK_CACHE_DIR))
+
+    seen_identities = set()
+    participants = []
+    is_named_group = False
+    for fn in underlying_files:
+        stem = Path(fn).stem
+        if "," in stem:
+            for p in (effective_group_participants(fn, my_handles_norm) or []):
+                person = handle_map.get(norm_handle(p))
+                identity = person[0] if person else "raw:" + norm_handle(p)
+                if identity in seen_identities:
+                    continue
+                seen_identities.add(identity)
+                participants.append({"handle": p, "name": person[1] if person else None})
+        elif " " in stem:
+            is_named_group = True
+        else:
+            person = handle_map.get(norm_handle(stem))
+            identity = person[0] if person else "raw:" + norm_handle(stem)
+            if identity not in seen_identities:
+                seen_identities.add(identity)
+                participants.append({"handle": stem, "name": person[1] if person else None})
+
+    return jsonify({
+        "display_name": display_name,
+        "participants": participants,
+        "underlying_files": underlying_files,
+        "is_named_group": is_named_group,
+    })
 
 
 # ── API: find parent message of a reply ──────────────────────────────────────
