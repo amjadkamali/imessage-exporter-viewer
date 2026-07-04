@@ -389,7 +389,7 @@ def _get_emb_matrix():
 def index():
     conn = get_db()
     convs_recent = conn.execute(
-        "SELECT filename, name, msg_count, first_date, last_date FROM conversations ORDER BY last_date DESC NULLS LAST"
+        "SELECT filename, name, msg_count, last_date FROM conversations ORDER BY last_date DESC NULLS LAST"
     ).fetchall()
     convs_alpha = sorted(convs_recent, key=lambda c: (c["name"] or "").lower())
     conn.close()
@@ -398,11 +398,10 @@ def index():
         return "".join(
             '<div class="conv-item" data-fn="{fn}" onclick="loadConv(this)">'
             '<div class="conv-name">{name}</div>'
-            '<div class="conv-meta">{fd} → {ld}</div>'
+            '<div class="conv-meta">{ld}</div>'
             '<div class="conv-count">{cnt:,} messages</div></div>'.format(
                 fn=c["filename"].replace('"', '&quot;'),
                 name=c["name"],
-                fd=(c["first_date"] or "?")[:10],
                 ld=(c["last_date"] or "?")[:10],
                 cnt=c["msg_count"]
             )
