@@ -719,14 +719,23 @@ function setSort(mode) {
 // the Recent and A-Z lists). Matches against the visible display name
 // (resolved contact/group name) or the raw filename (which for 1:1 threads
 // is the phone number/handle itself, so partial digits work too).
+// Split on whitespace into separate terms, each checked independently --
+// "tom beth" finds "Tom & Beth" even though that exact phrase never
+// appears verbatim anywhere, since "tom" and "beth" each individually
+// match. All terms must match somewhere (not necessarily the same one of
+// name/filename) for the conversation to show; a single-word query keeps
+// working exactly as a plain substring search always did.
 function filterThreads() {
   var recip = document.getElementById('recipientInput').value.trim().toLowerCase();
+  var terms = recip.split(/\s+/).filter(function(t) { return t.length > 0; });
   document.querySelectorAll('.conv-item').forEach(function(item) {
-    if (!recip) { item.style.display = ''; return; }
+    if (!terms.length) { item.style.display = ''; return; }
     var nameEl = item.querySelector('.conv-name');
     var name = nameEl ? nameEl.textContent.toLowerCase() : '';
     var fn = (item.getAttribute('data-fn') || '').toLowerCase();
-    var match = name.indexOf(recip) !== -1 || fn.indexOf(recip) !== -1;
+    var match = terms.every(function(term) {
+      return name.indexOf(term) !== -1 || fn.indexOf(term) !== -1;
+    });
     item.style.display = match ? '' : 'none';
   });
 }
