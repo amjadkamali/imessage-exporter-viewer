@@ -1014,19 +1014,31 @@ function convSearchPrev() {
   jumpToConvSearchResult(convSearchIdx);
 }
 
-function jumpToConvSearchResult(idx) {
-  var target = convSearchResults[idx];
-  if (!target || !currentFn) return;
-  var existing = document.querySelector('.message-row[data-mid="' + target.id + '"]');
+// Shared by every "jump to a specific message" caller (conv search
+// results, the attachment grid, the lightbox on close): if the message is
+// already rendered, just scroll to it directly; otherwise ask the server
+// which row it's on and fetch a window centered there. This works
+// regardless of whether the message is currently in the DOM at all --
+// unlike relying on a live element reference, which breaks the moment the
+// virtual scroll culls that element to keep the DOM bounded.
+function jumpToMessageId(msgId) {
+  if (!currentFn || !msgId) return;
+  var existing = document.querySelector('.message-row[data-mid="' + msgId + '"]');
   if (existing) { existing.scrollIntoView({block: 'center'}); flashHighlight(existing); return; }
-  fetch('/api/message_page?filename=' + encodeURIComponent(currentFn) + '&msg_id=' + encodeURIComponent(target.id) + '&per_page=' + WIN)
+  fetch('/api/message_page?filename=' + encodeURIComponent(currentFn) + '&msg_id=' + encodeURIComponent(msgId) + '&per_page=' + WIN, {priority: 'high'})
     .then(function(r){ return r.json(); })
     .then(function(d) {
       if (!d.row) return;
-      hlMid = target.id;
+      hlMid = msgId;
       resetPane();
       fetchRows(null, 'initial-row:' + (d.row - 1));
     });
+}
+
+function jumpToConvSearchResult(idx) {
+  var target = convSearchResults[idx];
+  if (!target) return;
+  jumpToMessageId(target.id);
 }
 
 // ── Attachments viewer ────────────────────────────────────────────────────────
@@ -1109,18 +1121,8 @@ function renderAttachmentsGrid(attachments) {
 }
 
 function jumpToAttachment(msgId) {
-  if (!currentFn) return;
   closeAttachmentsViewer();
-  var existing = document.querySelector('.message-row[data-mid="' + msgId + '"]');
-  if (existing) { existing.scrollIntoView({block: 'center'}); flashHighlight(existing); return; }
-  fetch('/api/message_page?filename=' + encodeURIComponent(currentFn) + '&msg_id=' + encodeURIComponent(msgId) + '&per_page=' + WIN, {priority: 'high'})
-    .then(function(r){ return r.json(); })
-    .then(function(d) {
-      if (!d.row) return;
-      hlMid = msgId;
-      resetPane();
-      fetchRows(null, 'initial-row:' + (d.row - 1));
-    });
+  jumpToMessageId(msgId);
 }
 
 // ── Jump to top / bottom ──────────────────────────────────────────────────────
@@ -1333,9 +1335,25 @@ document.addEventListener('click', function(e) {
   e.stopPropagation();
 });
 function closeLightbox() {
+  var lastViewed = currentLightboxImg;
   document.getElementById('lightbox').classList.remove('open');
   document.getElementById('lightboxImg').src = '';
   currentLightboxImg = null;
+  // Jump back to wherever the last-viewed image actually is -- without
+  // this, closing after browsing through several images via next/prev
+  // would leave the conversation sitting at whatever position it was at
+  // before the lightbox ever opened, disconnected from what was just
+  // being looked at. Reading data-mid off the ancestor .message-row works
+  // even if that row has since been culled from the DOM by the virtual
+  // scroll -- a detached element still has its own attributes intact, and
+  // jumpToMessageId() re-fetches by id from the server rather than
+  // needing a live element reference, so this always resolves to the
+  // right place regardless of current DOM state.
+  if (lastViewed) {
+    var row = lastViewed.closest('.message-row');
+    var msgId = row ? row.getAttribute('data-mid') : null;
+    if (msgId) jumpToMessageId(msgId);
+  }
 }
 document.addEventListener('keydown', function(e) {
   if (!document.getElementById('lightbox').classList.contains('open')) return;
