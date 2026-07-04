@@ -334,6 +334,56 @@ def parse_messages(html_content):
             'raw_html': raw_html_override if raw_html_override is not None else block,
         }
 
+    def parse_announcement_block(block):
+        """
+        Parse a <div class="announcement">...</div> block: a system event
+        (renamed conversation, added/removed participant, deleted message,
+        etc), not a real message. These carry no message-guid at all, so
+        they're given a stable pseudo-GUID derived from their own full
+        text -- which already includes their own timestamp text, exactly
+        matching merge_html_exports.py's identical approach to this
+        identical problem (see find_announcement_containers() there),
+        including deliberately hashing the FULL text (timestamp included):
+        two "Bob left the conversation" events at genuinely different
+        times must hash differently, or the second would be wrongly
+        dropped as an incorrect duplicate of the first.
+        raw_html is preserved as-is and rendered directly by the frontend
+        -- the app's own CSS already has a dedicated `.announcement` rule
+        (centered, muted, small) that's simply never been exercised until
+        now, since this is the first time these blocks get parsed as
+        their own entries instead of silently vanishing into whichever
+        message happened to sit next to them.
+        """
+        ts_raw = None
+        m = re.search(r'<span class="timestamp">\s*<a[^>]*>([^<]+)</a>', block)
+        if m:
+            ts_raw = m.group(1).strip()
+        else:
+            m = re.search(r'<span class="timestamp">([^<(]+)', block)
+            if m:
+                ts_raw = m.group(1).strip()
+
+        text = re.sub(r'<[^>]+>', ' ', block)
+        text = _html.unescape(text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        if not text:
+            return None
+
+        pseudo_guid = "ANNOUNCEMENT:" + hashlib.sha1(text.encode('utf-8')).hexdigest()
+        ts_iso = parse_timestamp(ts_raw)
+
+        return {
+            'id': pseudo_guid,
+            'content_hash': pseudo_guid,
+            'timestamp_raw': ts_raw,
+            'timestamp': ts_iso,
+            'sender': None,
+            'text': text,
+            'attachments': [],
+            'direction': 'announcement',
+            'raw_html': block,
+        }
+
     guid_to_block_start = {}
     for gm in re.finditer(r'<div class="message">(?:(?!<div class="message">).)*?message-guid=([A-F0-9a-f-]+)',
                           html_content, re.DOTALL):
@@ -359,12 +409,21 @@ def parse_messages(html_content):
         return html_content[start:i]
 
     stripped = strip_replies(html_content)
-    blocks = re.split(r'(?=<div class="message">)', stripped)
+    # FORK: also split on announcement divs, not just message divs -- see
+    # parse_announcement_block() for why these need their own handling.
+    # Real imessage-exporter output renders this as `<div class ="announcement">`
+    # (note the space BEFORE the equals sign, not after) -- confirmed directly
+    # from the exporter's own source (format_announcement() in html.rs), not
+    # guessed, since getting this wrong here means silently matching nothing.
+    blocks = re.split(r'(?=<div class="message">|<div class\s*=\s*"announcement">)', stripped)
     seen_guids = set()
     for block in blocks:
-        if '<div class="message">' not in block:
+        if '<div class="message">' in block:
+            msg = parse_block(block)
+        elif re.match(r'\s*<div class\s*=\s*"announcement">', block):
+            msg = parse_announcement_block(block)
+        else:
             continue
-        msg = parse_block(block)
         if msg is None:
             continue
         guid = msg['id'] if re.fullmatch(r'[A-F0-9a-f-]{36}', msg['id']) else None
