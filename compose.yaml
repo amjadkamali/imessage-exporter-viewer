@@ -12,7 +12,9 @@ services:
     environment:
       - ARCHIVE_ROOT=/archives
       - DB_PATH=/data/imessage.db
-      - WATCH_INTERVAL_SECONDS=60
+      - WATCH_INTERVAL_SECONDS=1800
+      - ADDRESSBOOK_CACHE_DIR=/archives/Contacts
+      - IMESSAGE_MY_HANDLES="+1555123456 test@example.com"
     restart: unless-stopped
 
 volumes:
