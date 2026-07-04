@@ -242,6 +242,13 @@ span.reply_context { opacity: 0.6; font-size: 0.85em; font-style: italic; displa
 #lightbox.open { display: flex; }
 #lightbox img { max-width: 95vw; max-height: 95vh; border-radius: 8px; object-fit: contain;
                 box-shadow: 0 8px 40px rgba(0,0,0,0.6); }
+.lightbox-nav { display: none; position: absolute; top: 50%; transform: translateY(-50%);
+                background: rgba(255,255,255,0.12); border: none; color: white; font-size: 28px;
+                width: 48px; height: 48px; border-radius: 50%; cursor: pointer; align-items: center;
+                justify-content: center; z-index: 1001; }
+.lightbox-nav:hover { background: rgba(255,255,255,0.22); }
+#lightboxPrev { left: 20px; }
+#lightboxNext { right: 20px; }
 
 /* Constrain media to reasonable sizes */
 .message img { max-width: min(360px, 65vw) !important; max-height: 50vh !important; height: auto !important; width: auto !important; border-radius: 12px; display: block; }
@@ -613,7 +620,7 @@ function resetPane() {
 // N in initial-row:N is the 0-based target row to center the viewport on.
 // All fetches use ?offset= so the server returns exactly the rows we want
 // and we always know the precise row index of what was returned.
-function fetchRows(unused, mode) {
+function fetchRows(onComplete, mode) {
   if (loading || !currentFn) return;
   loading = true;
   showLoading(true);
@@ -659,7 +666,7 @@ function fetchRows(unused, mode) {
       if (mode === 'initial-bottom' && fetchOffset === -1) {
         loading = false;
         fetchOffset = Math.max(0, totalMsgs - WIN);
-        fetchRows(null, 'initial-bottom');
+        fetchRows(onComplete, 'initial-bottom');
         return;
       }
 
@@ -759,6 +766,7 @@ function fetchRows(unused, mode) {
 
       loading = false;
       showLoading(false);
+      if (typeof onComplete === 'function') onComplete();
     })
     .catch(function(){ loading = false; showLoading(false); });
 }
@@ -1233,21 +1241,91 @@ function pinToBottom(c) {
 }
 
 // ── Lightbox ──────────────────────────────────────────────────────────────────
+var currentLightboxImg = null;
+
+function lightboxImages() {
+  // The navigable set is whatever's currently rendered in #messages -- since
+  // the app uses virtual scroll, this naturally matches what a user could
+  // otherwise reach by scrolling, without needing to fetch beyond the
+  // currently-loaded window just to support arrow navigation.
+  return Array.prototype.slice.call(document.querySelectorAll('#messages img')).filter(function(img) {
+    return !img.closest('.replies');
+  });
+}
+
+function openLightbox(img) {
+  currentLightboxImg = img;
+  document.getElementById('lightboxImg').src = img.src;
+  document.getElementById('lightbox').classList.add('open');
+  updateLightboxNav();
+}
+
+function updateLightboxNav() {
+  var images = lightboxImages();
+  var idx = images.indexOf(currentLightboxImg);
+  // Nav stays available not just when the next/prev image is already
+  // rendered, but also when there's simply more conversation to load in
+  // that direction -- we won't know if it contains another image until we
+  // actually fetch and look, but "might be more" is the right default
+  // rather than treating "not loaded yet" as "doesn't exist".
+  var hasPrev = idx > 0 || domStart > 0;
+  var hasNext = (idx !== -1 && idx < images.length - 1) || domEnd < totalMsgs;
+  document.getElementById('lightboxPrev').style.display = hasPrev ? 'flex' : 'none';
+  document.getElementById('lightboxNext').style.display = hasNext ? 'flex' : 'none';
+}
+
+var lightboxLoading = false;
+
+function lightboxNav(direction) {
+  if (lightboxLoading) return;
+  var images = lightboxImages();
+  var idx = images.indexOf(currentLightboxImg);
+  if (idx === -1) return;
+  var next = images[idx + direction];
+  if (next) {
+    openLightbox(next);
+    return;
+  }
+  // Reached the edge of what's currently rendered. Extend the loaded
+  // window in that direction using the exact same fetch the virtual
+  // scroll itself uses (append/prepend), then try again -- this keeps
+  // extending automatically through any stretch of text-only messages
+  // until it either finds the next image or genuinely reaches the start
+  // or end of the conversation.
+  var canLoadMore = direction > 0 ? domEnd < totalMsgs : domStart > 0;
+  // fetchRows() silently no-ops if a fetch is already in flight for some
+  // other reason (e.g. a scroll-triggered sentinel) -- without this check,
+  // that would mean our callback never fires and lightboxLoading gets
+  // stuck true forever. Bailing here just means this attempt does nothing;
+  // pressing the arrow again a moment later works normally.
+  if (!canLoadMore || loading) return;
+  lightboxLoading = true;
+  fetchRows(function() {
+    lightboxLoading = false;
+    lightboxNav(direction);
+  }, direction > 0 ? 'append' : 'prepend');
+}
+
 document.addEventListener('click', function(e) {
   var img = e.target;
   if (img.tagName !== 'IMG') return;
   if (!img.closest('#messages')) return;
   // Don't lightbox if it's inside a reply preview
   if (img.closest('.replies')) return;
-  document.getElementById('lightboxImg').src = img.src;
-  document.getElementById('lightbox').classList.add('open');
+  openLightbox(img);
   e.stopPropagation();
 });
 function closeLightbox() {
   document.getElementById('lightbox').classList.remove('open');
   document.getElementById('lightboxImg').src = '';
+  currentLightboxImg = null;
 }
-document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeLightbox(); });
+document.addEventListener('keydown', function(e) {
+  if (!document.getElementById('lightbox').classList.contains('open')) return;
+  if (e.key === 'Escape') closeLightbox();
+  else if (e.key === 'ArrowLeft') lightboxNav(-1);
+  else if (e.key === 'ArrowRight') lightboxNav(1);
+});
 
 // ── Handle URL hash on page load (from search result click) ──────────────────
 document.addEventListener('DOMContentLoaded', function() {
@@ -1288,7 +1366,11 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 </script>
 
-<div id="lightbox" onclick="closeLightbox()"><img id="lightboxImg" src="" alt=""></div>
+<div id="lightbox" onclick="closeLightbox()">
+  <button id="lightboxPrev" class="lightbox-nav" onclick="event.stopPropagation(); lightboxNav(-1)" title="Previous">&#8249;</button>
+  <img id="lightboxImg" src="" alt="">
+  <button id="lightboxNext" class="lightbox-nav" onclick="event.stopPropagation(); lightboxNav(1)" title="Next">&#8250;</button>
+</div>
 </body></html>"""
 
 
