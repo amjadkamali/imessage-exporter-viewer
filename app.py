@@ -414,6 +414,7 @@ def index():
 
     return """<!DOCTYPE html><html><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="format-detection" content="telephone=no">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💬</text></svg>">
 <title>iMessage Search</title><style>""" + CSS + """</style></head><body>
 <div class="header">
@@ -452,7 +453,6 @@ def index():
         <div class="pane-sub" id="paneSub"></div>
       </div>
       <div class="page-controls">
-        <span class="page-info" id="pageInfo"></span>
         <button class="btn" id="convSearchToggleBtn" onclick="toggleConvSearch()" title="Search this conversation">&#128269;</button>
         <button class="btn" id="attachmentsViewerToggleBtn" onclick="toggleAttachmentsViewer()" title="View all photos & videos">&#128247;</button>
         <button class="btn" id="dateJumpToggleBtn" onclick="toggleDateJump()" title="Jump to date" disabled>&#128197;</button>
@@ -1146,7 +1146,6 @@ function updateHeader(name, total) {
   document.getElementById('paneHeader').style.display = 'flex';
   document.getElementById('paneTitle').textContent = name;
   document.getElementById('paneSub').textContent = total.toLocaleString() + ' messages';
-  document.getElementById('pageInfo').textContent = total.toLocaleString() + ' messages';
 }
 
 function toggleDateJump() {
@@ -1754,6 +1753,7 @@ def search():
     return (
         '<!DOCTYPE html><html><head><meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<meta name="format-detection" content="telephone=no">'
         '<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💬</text></svg>">'
         '<title>Search: ' + query + '</title><style>' + CSS + '</style></head><body>'
         '<div class="header">'
@@ -1924,6 +1924,7 @@ def search_images():
     return (
         '<!DOCTYPE html><html><head><meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<meta name="format-detection" content="telephone=no">'
         '<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💬</text></svg>">'
         '<title>Image Search: ' + query + '</title>'
         '<style>' + CSS + '</style></head><body>'
