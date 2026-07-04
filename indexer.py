@@ -28,6 +28,7 @@ ARCHIVE_ROOT = os.environ.get("ARCHIVE_ROOT", "/archives")
 DB_PATH = os.environ.get("DB_PATH", "/data/imessage.db")
 MODEL_DIR = os.environ.get("MODEL_DIR", "/data/models")
 ADDRESSBOOK_CACHE_DIR = os.environ.get("ADDRESSBOOK_CACHE_DIR", "/addressbook-cache")
+MY_HANDLES = os.environ.get("IMESSAGE_MY_HANDLES", "")
 
 IMAGE_EXTS = frozenset({'.heic', '.heif', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'})
 
@@ -200,7 +201,7 @@ def extract_contact_name(html_content, filename):
     return None
 
 
-def build_group_display_name(filename, phone_to_name):
+def build_group_display_name(filename, phone_to_name, my_handles_norm=frozenset()):
     """
     Given a group filename like '+15551234567, +15559876543.html' and a
     mapping of phone -> resolved name, return a human-readable group name.
@@ -208,12 +209,17 @@ def build_group_display_name(filename, phone_to_name):
     - Phone-number groups: substitute only standard NA numbers
       (+1XXXXXXXXXX); deduplicate resolved names so two numbers for the
       same person don't produce 'Jane Smith, Jane Smith'.
+    my_handles_norm, when given, strips your own handle out of the
+    participant list first -- see strip_self_handles() for why this
+    matters (a Messages glitch, not a real extra participant).
     """
     stem = Path(filename).stem
     if ',' not in stem:
         return stem
 
-    parts = [p.strip() for p in stem.split(',')]
+    parts = effective_group_participants(filename, my_handles_norm)
+    if parts is None:
+        parts = [p.strip() for p in stem.split(',')]
     resolved = []
     seen_names = set()
     for part in parts:
@@ -484,7 +490,7 @@ def get_or_create_archive(conn, path):
     return cur.lastrowid
 
 
-def index_file(conn, html_path, archive_id, phone_to_name):
+def index_file(conn, html_path, archive_id, phone_to_name, my_handles_norm=frozenset()):
     filename = Path(html_path).name
     name = Path(html_path).stem
     content = Path(html_path).read_text(encoding='utf-8', errors='replace')
@@ -493,7 +499,7 @@ def index_file(conn, html_path, archive_id, phone_to_name):
         return 0
 
     if is_group_filename(filename):
-        display_name = build_group_display_name(filename, phone_to_name)
+        display_name = build_group_display_name(filename, phone_to_name, my_handles_norm)
     else:
         contact_name = extract_contact_name(content, filename)
         display_name = contact_name if contact_name else name
@@ -742,6 +748,41 @@ def norm_handle(h):
     return norm_email(h) if "@" in h else norm_phone(h)
 
 
+def strip_self_handles(participants, my_handles_norm):
+    """
+    Messages occasionally glitches and inserts your own number/email into
+    a group chat's participant list -- a known, occasional bug, not a
+    real additional participant. Left alone, this can make an entirely
+    normal 1:1 conversation look like a 2-person group, or add a spurious
+    extra name to a real group's display name.
+    If every participant is one of your own handles, this is a genuine
+    chat-with-yourself and is left completely untouched. Otherwise, your
+    own handles are dropped before anything else happens.
+    Ported directly from merge_by_contact.py's function of the same name;
+    same behavior, since it's already correct there.
+    """
+    if not my_handles_norm:
+        return participants
+    filtered = [p for p in participants if norm_handle(p) not in my_handles_norm]
+    return filtered if filtered else participants
+
+
+def effective_group_participants(filename, my_handles_norm):
+    """
+    For a comma-separated group filename, return the participant list
+    after stripping any of your own handles that snuck in via the
+    glitch strip_self_handles() guards against. Returns None for named
+    groups (e.g. "Book Club - 5.html" -- no individual handles are
+    encoded in a named group's filename to strip in the first place) and
+    for non-group filenames.
+    """
+    stem = Path(filename).stem
+    if ',' not in stem:
+        return None
+    participants = [p.strip() for p in stem.split(',') if p.strip()]
+    return strip_self_handles(participants, my_handles_norm)
+
+
 def get_addressbook_cache_paths(cache_dir):
     """
     Mirror merge_by_contact.py's default_addressbook_paths(), but pointed
@@ -812,12 +853,17 @@ def build_handle_map(ab_paths):
 def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
     """
     (Re)build contact_groups / conversation_contact_group from the Address
-    Book cache. Only 1:1 conversations are considered -- group-chat
-    filenames contain a comma and are always skipped, since a group's
-    identity is its whole participant set, not any single member. Wipes
-    and rebuilds both tables on every call so a renamed contact or an
-    updated cache take effect immediately, without touching conversations
-    or messages at all -- if the cache is stale or missing entirely, this
+    Book cache. Ordinarily only 1:1 conversations are considered -- a
+    comma-separated group filename is skipped, since a real group's
+    identity is its whole participant set, not any single member. The one
+    exception: if stripping your own handle (see strip_self_handles(),
+    guarding against a real Messages glitch) leaves a "group" with
+    exactly one other participant, that's not actually a group at all --
+    it's a genuine 1:1 that the glitch disguised, and merge_by_contact.py
+    already treats it the same way for file-matching purposes. Wipes and
+    rebuilds both tables on every call so a renamed contact or an updated
+    cache take effect immediately, without touching conversations or
+    messages at all -- if the cache is stale or missing entirely, this
     just leaves both tables empty and every conversation behaves exactly
     as if grouping didn't exist, the same graceful degradation the sync
     script's own Address Book handling already has.
@@ -830,6 +876,8 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
     if not handle_map:
         return 0
 
+    my_handles_norm = frozenset(norm_handle(h) for h in MY_HANDLES.split() if h.strip())
+
     conn.execute("DELETE FROM conversation_contact_group")
     conn.execute("DELETE FROM contact_groups")
 
@@ -837,8 +885,13 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
     for row in conn.execute("SELECT id, filename FROM conversations").fetchall():
         stem = Path(row["filename"]).stem
         if "," in stem:
-            continue
-        person = handle_map.get(norm_handle(stem))
+            participants = effective_group_participants(row["filename"], my_handles_norm)
+            if participants is None or len(participants) != 1:
+                continue
+            handle = participants[0]
+        else:
+            handle = stem
+        person = handle_map.get(norm_handle(handle))
         if not person:
             continue
         contact_key, display_name = person
@@ -892,12 +945,13 @@ def run_indexer():
     print(f"  Resolved {len(phone_to_name)} phone numbers to names.")
 
     print("Pass 2: indexing all conversations...")
+    my_handles_norm = frozenset(norm_handle(h) for h in MY_HANDLES.split() if h.strip())
     for archive_path in archives:
         archive_id = get_or_create_archive(conn, archive_path)
         html_files = sorted(archive_path.glob("*.html"))
         print(f"\n[{archive_path.name}] {len(html_files)} conversations")
         for html_path in html_files:
-            n = index_file(conn, html_path, archive_id, phone_to_name)
+            n = index_file(conn, html_path, archive_id, phone_to_name, my_handles_norm)
             total_msgs += n
             if n:
                 print(f"  {html_path.name}: {n} messages", end='\r')
