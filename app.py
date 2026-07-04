@@ -32,7 +32,8 @@ from flask import Flask, request, jsonify, Response, redirect
 # guard that keeps this import side-effect-free.
 from indexer import (
     build_handle_map, get_addressbook_cache_paths, norm_handle,
-    effective_group_participants, MY_HANDLES, ADDRESSBOOK_CACHE_DIR,
+    effective_group_participants, looks_like_guessed_name,
+    MY_HANDLES, ADDRESSBOOK_CACHE_DIR,
 )
 
 DB_PATH      = os.environ.get("DB_PATH", "/data/imessage.db")
@@ -1351,7 +1352,7 @@ function renderConvInfo(data) {
       html += '</div>';
     });
   } else if (data.is_named_group) {
-    html += '<div class="conv-info-empty">Named group -- no participant handles in the export filename.</div>';
+    html += '<div class="conv-info-empty">No participant data found -- this export may predate chat.db-based participant lookup, or the underlying chat is no longer present in a recent snapshot.</div>';
   } else {
     html += '<div class="conv-info-empty">No participant details available.</div>';
   }
@@ -1811,6 +1812,7 @@ def api_conversation_info():
         "SELECT id, filename, name FROM conversations WHERE id IN (%s)" % placeholders, conv_ids
     ).fetchall()
     underlying_files = sorted((r["filename"] for r in rows))
+    filename_to_id = {r["filename"]: r["id"] for r in rows}
 
     contact_key_row = conn.execute(
         "SELECT contact_key FROM conversation_contact_group WHERE conversation_id=?", (conv_ids[0],)
@@ -1822,6 +1824,35 @@ def api_conversation_info():
         display_name = display["display_name"] if display else rows[0]["name"]
     else:
         display_name = rows[0]["name"]
+
+    # Raw handles for named groups, extracted from chat.db itself by the
+    # sync pipeline (see imessage-incremental-sync.sh) -- a named group's
+    # filename carries none of its own. Fetched per conv_id here so each
+    # underlying file's own snapshot of membership can be unioned below;
+    # deliberately never filtered against each other or required to
+    # agree, since chat.db membership is a point-in-time snapshot and
+    # real groups gain and lose members over time without becoming a
+    # different conversation.
+    # Wrapped defensively: this table can legitimately not exist yet if
+    # app.py is deployed ahead of a database that hasn't been reindexed
+    # with the newer indexer.py that creates it -- these two files run as
+    # separate processes and aren't guaranteed to update in lockstep, so
+    # this shouldn't take down the whole endpoint (every OTHER kind of
+    # conversation doesn't need this data at all) just because the newest
+    # index hasn't run yet. Same graceful-degradation posture as a
+    # missing Address Book cache elsewhere in this project: named/
+    # guessed-name groups simply show no participant data until the next
+    # successful reindex, exactly as if chat.db had no match for them.
+    raw_participants_by_convid = {}
+    try:
+        for r in conn.execute(
+            "SELECT conversation_id, handle FROM conversation_raw_participants WHERE conversation_id IN (%s)" % placeholders,
+            conv_ids
+        ):
+            raw_participants_by_convid.setdefault(r["conversation_id"], []).append(r["handle"])
+    except sqlite3.OperationalError:
+        pass
+
     conn.close()
 
     my_handles_norm = frozenset(norm_handle(h) for h in MY_HANDLES.split() if h.strip())
@@ -1851,11 +1882,17 @@ def api_conversation_info():
 
     for fn in underlying_files:
         stem = Path(fn).stem
-        if "," in stem:
+        if "," in stem and not looks_like_guessed_name(stem):
             for p in (effective_group_participants(fn, my_handles_norm) or []):
                 _record(p)
-        elif " " in stem:
+        elif "," in stem or " " in stem:
+            # Either a guessed-name summary ("John, Jane & 3 others") or a
+            # genuinely named group ("Real Group Chat") -- neither has any
+            # reliable handle information of its own in the filename, so
+            # both fall back to the same chat.db-derived source.
             is_named_group = True
+            for h in raw_participants_by_convid.get(filename_to_id[fn], []):
+                _record(h)
         else:
             _record(stem)
 

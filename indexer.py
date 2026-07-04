@@ -21,6 +21,7 @@ import sqlite3
 import hashlib
 import html as _html
 import time
+import json
 from pathlib import Path
 from datetime import datetime
 
@@ -533,6 +534,21 @@ def init_db(conn):
         contact_key TEXT NOT NULL REFERENCES contact_groups(contact_key)
     );
     CREATE INDEX IF NOT EXISTS idx_ccg_contact_key ON conversation_contact_group(contact_key);
+
+    -- FORK addition: real participant handles for a group chat, extracted
+    -- from chat.db's own chat_handle_join table (imessage-exporter's
+    -- filenames carry none for a named group) -- see
+    -- populate_raw_participants(). Purely descriptive/display data, never
+    -- used to decide which conversations merge into one: chat_handle_join
+    -- reflects CURRENT membership only, and people get added to or
+    -- removed from a real group over time, so two exports of the same
+    -- ongoing group can legitimately disagree here without being any
+    -- less the same conversation.
+    CREATE TABLE IF NOT EXISTS conversation_raw_participants (
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+        handle TEXT NOT NULL,
+        PRIMARY KEY (conversation_id, handle)
+    );
     """)
     conn.commit()
 
@@ -1098,6 +1114,64 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
           f"to {len(ab_paths)} address book source(s).")
     return grouped
 
+
+def populate_raw_participants(conn):
+    """
+    (Re)build conversation_raw_participants from each archive's own
+    group_participants.json, if the sync pipeline wrote one (see
+    imessage-incremental-sync.sh's participant-extraction step). This is
+    the only source of participant information for a NAMED group -- its
+    filename carries none at all -- and it's real data pulled directly
+    from chat.db's chat_handle_join table rather than guessed from
+    anything in the export itself.
+    Wipes and rebuilds every time, same as populate_contact_groups(): if
+    an archive's sidecar file is missing (an older export predating this
+    feature, or chat.db simply didn't have a matching GUID to correlate
+    against), that archive's named groups just have no participant data,
+    the same graceful degradation as everywhere else this project reads
+    optional sidecar data.
+    """
+    conn.execute("DELETE FROM conversation_raw_participants")
+
+    archive_rows = conn.execute("SELECT id, path FROM archives").fetchall()
+    filename_to_convid = {
+        r["filename"]: r["id"] for r in conn.execute("SELECT id, filename FROM conversations")
+    }
+
+    written = 0
+    for arch in archive_rows:
+        sidecar = Path(arch["path"]) / "group_participants.json"
+        if not sidecar.is_file():
+            continue
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8", errors="replace"))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  (skipping unreadable {sidecar}: {e})")
+            continue
+        if not isinstance(data, dict):
+            print(f"  (skipping {sidecar}: expected a JSON object, got {type(data).__name__})")
+            continue
+        for filename, handles in data.items():
+            conv_id = filename_to_convid.get(filename)
+            if conv_id is None:
+                continue
+            if not isinstance(handles, list):
+                print(f"  (skipping malformed entry for {filename!r} in {sidecar}: "
+                      f"expected a list of handles, got {type(handles).__name__})")
+                continue
+            for h in handles:
+                if not isinstance(h, str) or not h:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO conversation_raw_participants (conversation_id, handle) VALUES (?,?)",
+                    (conv_id, h)
+                )
+                written += 1
+    conn.commit()
+    if written:
+        print(f"Raw participants: {written} handle(s) recorded from chat.db-derived sidecar files.")
+    return written
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def run_indexer():
@@ -1161,6 +1235,7 @@ def run_indexer():
 
     print()
     populate_contact_groups(conn)
+    populate_raw_participants(conn)
 
     conn.close()
 
