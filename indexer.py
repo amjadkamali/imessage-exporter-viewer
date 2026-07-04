@@ -20,6 +20,7 @@ import re
 import sqlite3
 import hashlib
 import html as _html
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -37,6 +38,7 @@ MOBILECLIP_S0_PATH = Path(MODEL_DIR) / "mobileclip_s0.pt"
 # are genuinely different names, not just a style choice.
 ATTACHMENT_DIR_NAMES = ("attachments", "Attachments", "StickerCache")
 ATTACHMENT_SRC_RE = re.compile(r'src="((?:attachments|Attachments|StickerCache)/[^"]+)"')
+ATTACHMENT_HREF_RE = re.compile(r'href="((?:attachments|Attachments|StickerCache)/[^"]+)"')
 
 
 def ensure_mobileclip_checkpoint():
@@ -69,14 +71,18 @@ def is_export_dir(path):
     return has_html and has_attachments
 
 
-def discover_archives(root):
+def discover_archives(root, quiet=False):
     """
     Recursively scan root for imessage export directories.
     Returns list of Path objects sorted by directory mtime (oldest first).
+    quiet=True suppresses the discovery log lines -- used when this gets
+    called repeatedly from the file-change watch loop, where printing the
+    full archive list on every poll would spam the container logs.
     """
     root = Path(root)
     if not root.exists():
-        print(f"WARNING: ARCHIVE_ROOT not found: {root}")
+        if not quiet:
+            print(f"WARNING: ARCHIVE_ROOT not found: {root}")
         return []
 
     found = []
@@ -92,10 +98,11 @@ def discover_archives(root):
                     found.append(grandchild)
 
     found.sort(key=lambda p: p.stat().st_mtime)
-    print(f"Discovered {len(found)} archive(s) under {root}:")
-    for i, p in enumerate(found):
-        html_count = len(list(p.glob("*.html")))
-        print(f"  [{i}] {p} ({html_count} conversations)")
+    if not quiet:
+        print(f"Discovered {len(found)} archive(s) under {root}:")
+        for i, p in enumerate(found):
+            html_count = len(list(p.glob("*.html")))
+            print(f"  [{i}] {p} ({html_count} conversations)")
     return found
 
 # ── Timestamp parsing ────────────────────────────────────────────────────────
@@ -273,7 +280,15 @@ def parse_messages(html_content):
 
         # FORK: originally hardcoded to only recognize 'src="attachments/...'.
         # Now matches this fork's "Attachments/"/"StickerCache/" folders too.
-        attachments = ATTACHMENT_SRC_RE.findall(block)
+        # Also matches href= links, not just src= -- image attachments are
+        # rendered as <img src="...">, but non-image attachments (PDFs,
+        # documents, anything imessage-exporter doesn't inline-preview) are
+        # rendered as <a href="...">filename</a>. The original upstream
+        # indexer only ever checked src=, so non-image attachments were
+        # silently never recorded as attachments at all -- has_attachment
+        # and attachment_path stayed unset for them even though app.py's
+        # own URL-rewriting logic already handled href= links correctly.
+        attachments = ATTACHMENT_SRC_RE.findall(block) + ATTACHMENT_HREF_RE.findall(block)
 
         guid = None
         m = re.search(r'message-guid=([A-F0-9a-f-]+)', block)
@@ -733,6 +748,71 @@ def run_indexer():
     conn.close()
 
 
+# ── Watch for changes and reindex ────────────────────────────────────────────
+# FORK addition: periodically re-runs the indexer when it detects that
+# conversation HTML files have changed, so an external incremental-sync
+# pipeline writing into the same ARCHIVE_ROOT gets picked up automatically
+# without needing to restart this container.
+#
+# This polls file mtimes rather than using filesystem events (inotify /
+# the `watchdog` package). That's a deliberate choice, not a simplification
+# for its own sake: this project runs on macOS, bind-mounting a host
+# directory into the container, and Docker Desktop on macOS has a long,
+# still-ongoing history of not reliably propagating inotify events from a
+# bind-mounted host directory into the container (see docker/for-mac
+# issues #2216, #681, #2417, #5755, and similar reports against
+# docker/for-win -- the underlying VM/VirtioFS layer is the common
+# thread). An event-based watcher could silently miss changes in exactly
+# this project's own setup. Polling mtimes has no such dependency -- it
+# works the same way regardless of how the volume is mounted.
+
+def get_latest_mtime(root):
+    """
+    Return the most recent mtime among all .html files across every
+    discovered archive directory, or 0 if none found. Reuses
+    discover_archives() (quietly) so this respects the same layout rules
+    as normal indexing. Only checks the .html files directly inside each
+    archive's own top level -- never recurses into Attachments/
+    StickerCache, which sit alongside them and can be far larger, since a
+    changed .html file is always what actually indicates new or edited
+    messages.
+    """
+    latest = 0.0
+    for archive_path in discover_archives(root, quiet=True):
+        for html_path in archive_path.glob("*.html"):
+            try:
+                m = html_path.stat().st_mtime
+                if m > latest:
+                    latest = m
+            except OSError:
+                continue
+    return latest
+
+
+def watch_and_reindex(poll_interval):
+    """
+    Poll ARCHIVE_ROOT every poll_interval seconds; if any .html file's
+    mtime is newer than the last time we checked, re-run the full indexer.
+    Re-running is safe and idempotent (existing messages are never
+    duplicated -- see index_file()'s INSERT OR IGNORE), so catching a sync
+    that's still mid-write and re-checking again next interval is a
+    harmless, expected outcome rather than something that needs special
+    handling.
+    """
+    print(f"=== Watching {ARCHIVE_ROOT} for changes (checking every {poll_interval}s) ===")
+    last_seen = get_latest_mtime(ARCHIVE_ROOT)
+    while True:
+        time.sleep(poll_interval)
+        try:
+            current = get_latest_mtime(ARCHIVE_ROOT)
+            if current > last_seen:
+                print(f"\nDetected changes under {ARCHIVE_ROOT}, reindexing...")
+                run_indexer()
+                last_seen = current
+        except Exception as e:
+            print(f"Watch loop error (will retry in {poll_interval}s): {e}")
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == 'embed':
@@ -744,5 +824,7 @@ if __name__ == "__main__":
         init_db(conn)
         embed_images(conn)
         conn.close()
+    elif len(sys.argv) > 1 and sys.argv[1] == 'watch':
+        watch_and_reindex(int(os.environ.get("WATCH_INTERVAL_SECONDS", "60")))
     else:
         run_indexer()

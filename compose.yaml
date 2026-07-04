@@ -12,6 +12,7 @@ services:
     environment:
       - ARCHIVE_ROOT=/archives
       - DB_PATH=/data/imessage.db
+      - WATCH_INTERVAL_SECONDS=60
     restart: unless-stopped
 
 volumes:
