@@ -853,15 +853,28 @@ def build_handle_map(ab_paths):
 def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
     """
     (Re)build contact_groups / conversation_contact_group from the Address
-    Book cache. Ordinarily only 1:1 conversations are considered -- a
-    comma-separated group filename is skipped, since a real group's
-    identity is its whole participant set, not any single member. The one
-    exception: if stripping your own handle (see strip_self_handles(),
-    guarding against a real Messages glitch) leaves a "group" with
-    exactly one other participant, that's not actually a group at all --
-    it's a genuine 1:1 that the glitch disguised, and merge_by_contact.py
-    already treats it the same way for file-matching purposes. Wipes and
-    rebuilds both tables on every call so a renamed contact or an updated
+    Book cache. Three cases for a conversation's filename:
+      1. Bare handle (1:1): looked up directly in the Address Book.
+      2. Comma-separated "group" that collapses to one real participant
+         after stripping your own handle (see strip_self_handles(),
+         guarding against a real Messages glitch): treated exactly like
+         case 1 -- it's a disguised 1:1, not an actual group.
+      3. A genuine multi-person group (2+ participants remain after
+         stripping): matched by its RESOLVED participant set rather than
+         its literal handles, so the same real group of people is
+         recognized as one conversation even if a member's handle
+         changed between exports (a new phone number, say) -- as long as
+         the Address Book has both their old and new handle on file. An
+         unresolved participant falls back to their own normalized
+         handle as their "identity" for this matching, which still
+         correctly matches an identical later export of that same
+         unresolved handle, just won't survive that specific person's
+         handle changing later (the same known limitation as case 1).
+    Named groups (no commas at all) are untouched by any of this --
+    there's no handle information in a named group's filename to resolve
+    or match by, so they continue to be matched only by exact filename,
+    same as before this feature existed.
+    Wipes and rebuilds every time so a renamed contact or an updated
     cache take effect immediately, without touching conversations or
     messages at all -- if the cache is stale or missing entirely, this
     just leaves both tables empty and every conversation behaves exactly
@@ -882,19 +895,44 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
     conn.execute("DELETE FROM contact_groups")
 
     grouped = 0
+    group_matched = 0
     for row in conn.execute("SELECT id, filename FROM conversations").fetchall():
         stem = Path(row["filename"]).stem
         if "," in stem:
             participants = effective_group_participants(row["filename"], my_handles_norm)
-            if participants is None or len(participants) != 1:
+            if not participants:
                 continue
-            handle = participants[0]
+            if len(participants) == 1:
+                # Disguised 1:1 -- same handling as a bare handle below.
+                person = handle_map.get(norm_handle(participants[0]))
+                if not person:
+                    continue
+                contact_key, display_name = person
+            else:
+                # Genuine multi-person group: build a canonical identity
+                # for each participant (their contact_key if known,
+                # otherwise their own normalized handle), so the group's
+                # key is deterministic and identical no matter which of
+                # its several possible export filenames produced it.
+                identities = set()
+                names = set()
+                for p in participants:
+                    person = handle_map.get(norm_handle(p))
+                    if person:
+                        identities.add(person[0])
+                        names.add(person[1])
+                    else:
+                        identities.add("unresolved:" + norm_handle(p))
+                        names.add(p)
+                contact_key = "group:" + "|".join(sorted(identities))
+                display_name = ", ".join(sorted(names))
+                group_matched += 1
         else:
-            handle = stem
-        person = handle_map.get(norm_handle(handle))
-        if not person:
-            continue
-        contact_key, display_name = person
+            person = handle_map.get(norm_handle(stem))
+            if not person:
+                continue
+            contact_key, display_name = person
+
         conn.execute(
             "INSERT OR IGNORE INTO contact_groups (contact_key, display_name) VALUES (?,?)",
             (contact_key, display_name)
@@ -905,7 +943,8 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
         )
         grouped += 1
     conn.commit()
-    print(f"Contact grouping: {grouped} conversation(s) linked to {len(ab_paths)} address book source(s).")
+    print(f"Contact grouping: {grouped} conversation(s) linked ({group_matched} via group participant-set matching) "
+          f"to {len(ab_paths)} address book source(s).")
     return grouped
 
 # ── Main ─────────────────────────────────────────────────────────────────────

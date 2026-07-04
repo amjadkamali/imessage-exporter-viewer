@@ -39,25 +39,40 @@ def resolve_conversation_ids(conn, filename):
     """
     Expand a filename into every conversation_id that should be treated
     as the same conversation for display purposes: just the one id for
-    an unresolved handle or a group chat, or every conversation_id
+    an unresolved handle or an unmatched group, or every conversation_id
     sharing the same contact_key (see conversation_contact_group) when
-    the filename resolves to a known Address Book contact who has more
-    than one handle -- their phone number's conversation and their
-    email's conversation, for instance.
+    the filename resolves to a known Address Book contact or a matched
+    multi-person group.
     Called by every endpoint that takes a filename, so a click from
     anywhere (the sidebar, a search result, an image, a reply-jump) is
     correct regardless of which specific handle it happened to carry --
     correctness lives here once, rather than needing every caller that
     manufactures a filename to already know about grouping.
-    Also accepts a comma-joined list of filenames (what a merged
-    sidebar entry's data-fn holds, e.g. "+1555....html,jane@....html"),
-    resolving each individually and returning the union -- these should
-    normally all resolve to the same group anyway, but handling it as a
-    union rather than assuming that is more robust than it needs to be
-    on purpose.
+    Tries the filename AS A WHOLE first. This matters: a genuine
+    multi-person group chat's OWN filename legitimately contains a comma
+    (e.g. "+1555..., +1999....html"), so a merged sidebar entry's data-fn
+    uses pipe rather than comma to join multiple real filenames together
+    (see the sidebar-building code in index()) -- comma could never
+    safely do that job without risking exactly this ambiguity. Trying
+    the whole string as a single filename first means a real group's own
+    filename is never misread as if it were several filenames; only when
+    no single conversation matches the whole string does this fall back
+    to splitting on pipe, which is what actually handles the
+    merged-sidebar-entry case correctly.
     """
+    row = conn.execute("SELECT id FROM conversations WHERE filename=?", (filename,)).fetchone()
+    if row:
+        group = conn.execute(
+            "SELECT contact_key FROM conversation_contact_group WHERE conversation_id=?", (row["id"],)
+        ).fetchone()
+        if not group:
+            return [row["id"]]
+        return [r["conversation_id"] for r in conn.execute(
+            "SELECT conversation_id FROM conversation_contact_group WHERE contact_key=?", (group["contact_key"],)
+        )]
+
     all_ids = set()
-    for fn in filename.split(","):
+    for fn in filename.split("|"):
         fn = fn.strip()
         if not fn:
             continue
@@ -466,11 +481,16 @@ def index():
 
     merged = [
         {
-            # Comma-joined real handles, not an opaque id -- this is what
-            # makes "Find a thread" keep matching a phone number or email
-            # directly against data-fn with zero changes needed to the
-            # filter itself; see filterThreads() below.
-            "filename": ",".join(sorted(g["filenames"])),
+            # Pipe-joined real handles, not comma-joined: a group chat's
+            # OWN filename can itself legitimately contain a comma (any
+            # multi-person group's filename does), so comma can't safely
+            # separate MULTIPLE filenames here without risking exactly
+            # that ambiguity. Pipe also still makes "Find a thread" keep
+            # matching a phone number or email directly against data-fn
+            # with zero changes needed to the filter itself -- see
+            # filterThreads() below, which does a plain substring search
+            # regardless of what character separates the pieces.
+            "filename": "|".join(sorted(g["filenames"])),
             "name": names.get(key, key),
             "msg_count": g["msg_count"],
             "last_date": g["last_date"],
