@@ -242,12 +242,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 .conv-info-section-label { font-size: 11px; color: #8e8e93; text-transform: uppercase;
   letter-spacing: 0.5px; margin: 14px 0 6px; }
 .conv-info-section-label:first-child { margin-top: 0; }
-.conv-info-participant { display: flex; justify-content: space-between; align-items: baseline;
-  gap: 10px; padding: 6px 0; border-bottom: 1px solid #3a3a3c33; }
+.conv-info-participant { padding: 7px 0; border-bottom: 1px solid #3a3a3c33; }
 .conv-info-participant:last-child { border-bottom: none; }
-.conv-info-participant-name { font-size: 14px; }
-.conv-info-participant-handle { font-size: 12px; color: #8e8e93; white-space: nowrap;
-  overflow: hidden; text-overflow: ellipsis; }
+.conv-info-participant-name { font-size: 14px; margin-bottom: 2px; }
+.conv-info-participant-handle { font-size: 12px; color: #8e8e93; word-break: break-word; }
 .conv-info-file { font-size: 12px; color: #8e8e93; padding: 3px 0; word-break: break-word; }
 .conv-info-empty { font-size: 13px; color: #8e8e93; font-style: italic; }
 .msg-highlight { outline: 2px solid #ffd60a !important; border-radius: 20px !important; outline-offset: 3px !important; }
@@ -1336,16 +1334,21 @@ function renderConvInfo(data) {
   html += '<div class="conv-info-section-label">Participants</div>';
   if (data.participants && data.participants.length) {
     data.participants.forEach(function(p) {
+      html += '<div class="conv-info-participant">';
       if (p.name) {
-        html += '<div class="conv-info-participant">'
-              + '<span class="conv-info-participant-name">' + esc(p.name) + '</span>'
-              + '<span class="conv-info-participant-handle">' + esc(p.handle) + '</span>'
-              + '</div>';
+        html += '<div class="conv-info-participant-name">' + esc(p.name) + '</div>';
+        p.handles.forEach(function(h) {
+          html += '<div class="conv-info-participant-handle">' + esc(h) + '</div>';
+        });
       } else {
-        html += '<div class="conv-info-participant">'
-              + '<span class="conv-info-participant-name">' + esc(p.handle) + '</span>'
-              + '</div>';
+        // Unresolved -- no name to show, so each handle stands on its own
+        // as the identifying line (there's normally just one here, since
+        // an unresolved handle has nothing to unify it with any other).
+        p.handles.forEach(function(h) {
+          html += '<div class="conv-info-participant-name">' + esc(h) + '</div>';
+        });
       }
+      html += '</div>';
     });
   } else if (data.is_named_group) {
     html += '<div class="conv-info-empty">Named group -- no participant handles in the export filename.</div>';
@@ -1770,21 +1773,31 @@ def api_message_page():
 def api_conversation_info():
     """
     Surfaces what's actually behind the currently-viewed conversation:
-    its resolved participants (with Address Book names where known), and
-    every real underlying .html file merged into it. The second part
-    matters more here than it might for other endpoints -- this project
-    now has THREE separate, independent mechanisms that can merge several
-    files into one conversation (disguised-1:1 collapse, resolved
-    participant-set matching, and named-group name-collision matching),
-    and the last of those in particular can't fully rule out two
-    genuinely unrelated groups that just happen to share a name. Showing
-    the underlying files plainly gives a direct way to notice and catch
-    that, rather than trusting a merge silently.
-    Participants are recomputed here on demand from the underlying
-    filenames rather than read from contact_groups, which only stores the
-    single, already-combined display_name for a group -- not its
-    individual participant breakdown -- so this mirrors
-    populate_contact_groups()'s own per-file parsing logic directly.
+    its resolved participants (with Address Book names where known, AND
+    every distinct handle seen for them -- not just one), and every real
+    underlying .html file merged into it. That last part matters more
+    here than it might for other endpoints -- this project now has THREE
+    separate, independent mechanisms that can merge several files into
+    one conversation (disguised-1:1 collapse, resolved participant-set
+    matching, and named-group name-collision matching), and the last of
+    those in particular can't fully rule out two genuinely unrelated
+    groups that just happen to share a name. Showing the underlying files
+    plainly gives a direct way to notice and catch that, rather than
+    trusting a merge silently.
+    Participants (and their full handle sets) are recomputed here on
+    demand from the underlying filenames rather than read from
+    contact_groups, which only stores the single, already-combined
+    display_name for a group -- not its individual participant
+    breakdown -- so this mirrors populate_contact_groups()'s own per-file
+    parsing logic directly. Collecting every handle per person (not just
+    the first one encountered) is exactly why the underlying-files
+    concept matters for participants too: the same real person can appear
+    under a different handle in each merged file (an old phone number in
+    one, a new one or an email in another), and the whole point of
+    resolving by identity in the first place is to recognize that as one
+    person, not several -- so it should show all of what was recognized
+    as belonging to them, not just whichever handle happened to be seen
+    first.
     """
     filename = request.args.get("filename", "")
     conn = get_db()
@@ -1814,27 +1827,42 @@ def api_conversation_info():
     my_handles_norm = frozenset(norm_handle(h) for h in MY_HANDLES.split() if h.strip())
     handle_map = build_handle_map(get_addressbook_cache_paths(ADDRESSBOOK_CACHE_DIR))
 
-    seen_identities = set()
-    participants = []
+    # identity -> {"name": ..., "handles": [raw handle, ...], "_seen_norm": set()}
+    # _seen_norm dedupes by NORMALIZED handle (so "+15551234567" appearing
+    # identically in two different merged files doesn't get listed twice),
+    # while the displayed handles list keeps each one's ORIGINAL raw
+    # formatting exactly as it appeared in its own filename, rather than
+    # normalizing it for display and losing that.
+    identity_data = {}
+    identity_order = []
     is_named_group = False
+
+    def _record(raw_handle):
+        norm_h = norm_handle(raw_handle)
+        person = handle_map.get(norm_h)
+        identity = person[0] if person else "raw:" + norm_h
+        if identity not in identity_data:
+            identity_data[identity] = {"name": person[1] if person else None, "handles": [], "_seen_norm": set()}
+            identity_order.append(identity)
+        entry = identity_data[identity]
+        if norm_h not in entry["_seen_norm"]:
+            entry["_seen_norm"].add(norm_h)
+            entry["handles"].append(raw_handle)
+
     for fn in underlying_files:
         stem = Path(fn).stem
         if "," in stem:
             for p in (effective_group_participants(fn, my_handles_norm) or []):
-                person = handle_map.get(norm_handle(p))
-                identity = person[0] if person else "raw:" + norm_handle(p)
-                if identity in seen_identities:
-                    continue
-                seen_identities.add(identity)
-                participants.append({"handle": p, "name": person[1] if person else None})
+                _record(p)
         elif " " in stem:
             is_named_group = True
         else:
-            person = handle_map.get(norm_handle(stem))
-            identity = person[0] if person else "raw:" + norm_handle(stem)
-            if identity not in seen_identities:
-                seen_identities.add(identity)
-                participants.append({"handle": stem, "name": person[1] if person else None})
+            _record(stem)
+
+    participants = [
+        {"name": identity_data[i]["name"], "handles": identity_data[i]["handles"]}
+        for i in identity_order
+    ]
 
     return jsonify({
         "display_name": display_name,
