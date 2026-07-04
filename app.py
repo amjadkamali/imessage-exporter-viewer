@@ -35,11 +35,52 @@ def get_db():
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
+def resolve_conversation_ids(conn, filename):
+    """
+    Expand a filename into every conversation_id that should be treated
+    as the same conversation for display purposes: just the one id for
+    an unresolved handle or a group chat, or every conversation_id
+    sharing the same contact_key (see conversation_contact_group) when
+    the filename resolves to a known Address Book contact who has more
+    than one handle -- their phone number's conversation and their
+    email's conversation, for instance.
+    Called by every endpoint that takes a filename, so a click from
+    anywhere (the sidebar, a search result, an image, a reply-jump) is
+    correct regardless of which specific handle it happened to carry --
+    correctness lives here once, rather than needing every caller that
+    manufactures a filename to already know about grouping.
+    Also accepts a comma-joined list of filenames (what a merged
+    sidebar entry's data-fn holds, e.g. "+1555....html,jane@....html"),
+    resolving each individually and returning the union -- these should
+    normally all resolve to the same group anyway, but handling it as a
+    union rather than assuming that is more robust than it needs to be
+    on purpose.
+    """
+    all_ids = set()
+    for fn in filename.split(","):
+        fn = fn.strip()
+        if not fn:
+            continue
+        row = conn.execute("SELECT id FROM conversations WHERE filename=?", (fn,)).fetchone()
+        if not row:
+            continue
+        group = conn.execute(
+            "SELECT contact_key FROM conversation_contact_group WHERE conversation_id=?", (row["id"],)
+        ).fetchone()
+        if group:
+            for r in conn.execute(
+                "SELECT conversation_id FROM conversation_contact_group WHERE contact_key=?", (group["contact_key"],)
+            ):
+                all_ids.add(r["conversation_id"])
+        else:
+            all_ids.add(row["id"])
+    return list(all_ids)
+
 def get_phone_to_name():
     """
     Build a phone->name map from resolved 1:1 conversations, cached on app.
     Any conversation whose filename stem is a bare E.164 phone number
-    (+ followed by 7-15 digits) and
+    (+ followed by 7-15 digits -- covers any country, not just NANP) and
     whose stored name differs from that number is a resolved mapping.
     """
     if not hasattr(app, '_phone_to_name'):
@@ -388,11 +429,58 @@ def _get_emb_matrix():
 @app.route("/")
 def index():
     conn = get_db()
-    convs_recent = conn.execute(
-        "SELECT filename, name, msg_count, last_date FROM conversations ORDER BY last_date DESC NULLS LAST"
-    ).fetchall()
-    convs_alpha = sorted(convs_recent, key=lambda c: (c["name"] or "").lower())
+    raw = conn.execute("""
+        SELECT c.filename, c.name, c.msg_count, c.last_date, ccg.contact_key
+        FROM conversations c
+        LEFT JOIN conversation_contact_group ccg ON ccg.conversation_id = c.id
+    """).fetchall()
+
+    # Conversations sharing a contact_key collapse into one combined row;
+    # everything else (unresolved handles, group chats -- which never get
+    # a contact_key to begin with, see populate_contact_groups()) passes
+    # through completely unchanged, exactly as before this feature
+    # existed. Grouped in Python rather than SQL: this dataset is small
+    # (a personal message archive, not millions of rows), and getting
+    # GROUP_CONCAT's ordering and aggregation exactly right here is far
+    # easier to verify plainly than to get right and re-verify in SQL.
+    groups = {}
+    singles = []
+    for r in raw:
+        if r["contact_key"] is None:
+            singles.append({
+                "filename": r["filename"], "name": r["name"],
+                "msg_count": r["msg_count"], "last_date": r["last_date"]
+            })
+        else:
+            g = groups.setdefault(r["contact_key"], {"filenames": [], "msg_count": 0, "last_date": None})
+            g["filenames"].append(r["filename"])
+            g["msg_count"] += r["msg_count"] or 0
+            if r["last_date"] and (g["last_date"] is None or r["last_date"] > g["last_date"]):
+                g["last_date"] = r["last_date"]
+
+    names = {}
+    if groups:
+        names = {row["contact_key"]: row["display_name"]
+                 for row in conn.execute("SELECT contact_key, display_name FROM contact_groups")}
     conn.close()
+
+    merged = [
+        {
+            # Comma-joined real handles, not an opaque id -- this is what
+            # makes "Find a thread" keep matching a phone number or email
+            # directly against data-fn with zero changes needed to the
+            # filter itself; see filterThreads() below.
+            "filename": ",".join(sorted(g["filenames"])),
+            "name": names.get(key, key),
+            "msg_count": g["msg_count"],
+            "last_date": g["last_date"],
+        }
+        for key, g in groups.items()
+    ]
+
+    all_convs   = singles + merged
+    convs_recent = sorted(all_convs, key=lambda c: c["last_date"] or "", reverse=True)
+    convs_alpha  = sorted(all_convs, key=lambda c: (c["name"] or "").lower())
 
     def make_conv_items(convs):
         return "".join(
@@ -1415,12 +1503,35 @@ def api_conversation():
     per_page = min(500, max(10, int(request.args.get("per_page", 100))))
 
     conn = get_db()
-    conv = conn.execute("SELECT * FROM conversations WHERE filename=?", (filename,)).fetchone()
-    if not conv:
+    conv_ids = resolve_conversation_ids(conn, filename)
+    if not conv_ids:
         conn.close()
         return jsonify({"error": "Not found"}), 404
 
-    total = conv["msg_count"]
+    if len(conv_ids) == 1:
+        # Fast path, identical to pre-grouping behavior: no aggregation
+        # needed when there's nothing to aggregate across.
+        conv = conn.execute("SELECT * FROM conversations WHERE id=?", (conv_ids[0],)).fetchone()
+        name       = conv["name"]
+        total      = conv["msg_count"]
+        first_date = conv["first_date"]
+        last_date  = conv["last_date"]
+    else:
+        placeholders = ",".join("?" * len(conv_ids))
+        agg = conn.execute(
+            "SELECT SUM(msg_count) as total, MIN(first_date) as first_date, MAX(last_date) as last_date "
+            "FROM conversations WHERE id IN (%s)" % placeholders, conv_ids
+        ).fetchone()
+        contact_key_row = conn.execute(
+            "SELECT contact_key FROM conversation_contact_group WHERE conversation_id=?", (conv_ids[0],)
+        ).fetchone()
+        display = conn.execute(
+            "SELECT display_name FROM contact_groups WHERE contact_key=?", (contact_key_row["contact_key"],)
+        ).fetchone()
+        name       = display["display_name"]
+        total      = agg["total"]
+        first_date = agg["first_date"]
+        last_date  = agg["last_date"]
 
     # Support direct offset param (preferred) or legacy page param
     if request.args.get("offset") is not None:
@@ -1432,12 +1543,13 @@ def api_conversation():
         page   = min(page, total_pages)
         offset = (page - 1) * per_page
 
+    placeholders = ",".join("?" * len(conv_ids))
     msgs = conn.execute("""
         SELECT id, timestamp, timestamp_raw, sender, text, direction, has_attachment, archive_id, attachment_path, raw_html
-        FROM messages WHERE conversation_id=?
+        FROM messages WHERE conversation_id IN (%s)
         ORDER BY timestamp ASC NULLS FIRST, rowid ASC
         LIMIT ? OFFSET ?
-    """, (conv["id"], per_page, offset)).fetchall()
+    """ % placeholders, conv_ids + [per_page, offset]).fetchall()
     conn.close()
 
     def msg_dict(m):
@@ -1470,12 +1582,12 @@ def api_conversation():
         return d
 
     return jsonify({
-        "name":       conv["name"],
+        "name":       name,
         "total":      total,
         "offset":     offset,
         "count":      len(msgs),
-        "first_date": conv["first_date"],
-        "last_date":  conv["last_date"],
+        "first_date": first_date,
+        "last_date":  last_date,
         "messages":   [msg_dict(m) for m in msgs]
     })
 
@@ -1490,23 +1602,31 @@ def api_message_page():
     per_page  = min(500, max(10, int(request.args.get("per_page", 100))))
 
     conn = get_db()
-    conv = conn.execute("SELECT * FROM conversations WHERE filename=?", (filename,)).fetchone()
-    if not conv:
+    conv_ids = resolve_conversation_ids(conn, filename)
+    if not conv_ids:
         conn.close()
         return jsonify({"error": "Not found"}), 404
-
-    cid = conv["id"]
+    placeholders = ",".join("?" * len(conv_ids))
 
     if msg_id:
         target = conn.execute(
-            "SELECT timestamp, rowid FROM messages WHERE id=? AND conversation_id=?",
-            (msg_id, cid)
+            "SELECT timestamp, rowid, conversation_id FROM messages WHERE id=? AND conversation_id IN (%s)" % placeholders,
+            [msg_id] + conv_ids
         ).fetchone()
         if target:
+            # (conversation_id, rowid) as the tiebreaker instead of bare
+            # rowid: rowid is only meaningfully ordered WITHIN one
+            # conversation's own insertion sequence, so comparing raw
+            # rowids across different underlying conversation rows (as a
+            # merged group spans) would be comparing unrelated numbers.
+            # This only matters as a tiebreak for messages sharing the
+            # exact same timestamp, which is already an inherent
+            # ambiguity between two different handles regardless.
             row_num = conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE conversation_id=? AND "
-                "(timestamp < ? OR (timestamp = ? AND rowid <= ?) OR timestamp IS NULL)",
-                (cid, target["timestamp"], target["timestamp"], target["rowid"])
+                "SELECT COUNT(*) FROM messages WHERE conversation_id IN (%s) AND "
+                "(timestamp < ? OR (timestamp = ? AND (conversation_id, rowid) <= (?, ?)) OR timestamp IS NULL)"
+                % placeholders,
+                conv_ids + [target["timestamp"], target["timestamp"], target["conversation_id"], target["rowid"]]
             ).fetchone()[0]
         else:
             row_num = 1
@@ -1515,9 +1635,9 @@ def api_message_page():
         # COUNT of messages with timestamp < target gives us the 0-based row
         # index of that first match, which we return as 1-based row_num.
         row_num = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE conversation_id=? AND "
-            "timestamp IS NOT NULL AND timestamp < ?",
-            (cid, timestamp)
+            "SELECT COUNT(*) FROM messages WHERE conversation_id IN (%s) AND "
+            "timestamp IS NOT NULL AND timestamp < ?" % placeholders,
+            conv_ids + [timestamp]
         ).fetchone()[0] + 1  # +1 converts to 1-based
     else:
         conn.close()
@@ -1539,28 +1659,33 @@ def api_reply_parent():
         return jsonify({"error": "Missing params"}), 400
 
     conn = get_db()
-    conv = conn.execute("SELECT id FROM conversations WHERE filename=?", (filename,)).fetchone()
-    if not conv:
+    conv_ids = resolve_conversation_ids(conn, filename)
+    if not conv_ids:
         conn.close()
         return jsonify({"error": "Not found"}), 404
+    placeholders = ",".join("?" * len(conv_ids))
 
     # Find the message whose raw_html contains this GUID inside a replies div.
     # The reply div has: id="GUID" on the outer .reply wrapper inside .replies.
     replies_pat = '%class="replies"%'
     guid_pat    = f'%id="{guid}"%'
     row = conn.execute(
-        "SELECT id, rowid FROM messages WHERE conversation_id=? "
-        "AND raw_html LIKE ? AND raw_html LIKE ?",
-        (conv["id"], guid_pat, replies_pat)
+        "SELECT id, rowid, conversation_id FROM messages WHERE conversation_id IN (%s) "
+        "AND raw_html LIKE ? AND raw_html LIKE ?" % placeholders,
+        conv_ids + [guid_pat, replies_pat]
     ).fetchone()
 
     if not row:
         conn.close()
         return jsonify({"row": None})
 
+    # (conversation_id, rowid) tiebreak -- see api_message_page for why
+    # bare rowid isn't meaningfully ordered across different underlying
+    # conversation rows in a merged group.
     row_num = conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE conversation_id=? AND rowid <= ?",
-        (conv["id"], row["rowid"])
+        "SELECT COUNT(*) FROM messages WHERE conversation_id IN (%s) AND (conversation_id, rowid) <= (?, ?)"
+        % placeholders,
+        conv_ids + [row["conversation_id"], row["rowid"]]
     ).fetchone()[0]
     conn.close()
     return jsonify({"parent_id": row["id"], "row": row_num})
@@ -1581,17 +1706,18 @@ def api_conversation_attachments():
         return jsonify({"attachments": []})
 
     conn = get_db()
-    conv = conn.execute("SELECT id FROM conversations WHERE filename=?", (filename,)).fetchone()
-    if not conv:
+    conv_ids = resolve_conversation_ids(conn, filename)
+    if not conv_ids:
         conn.close()
         return jsonify({"attachments": []})
+    placeholders = ",".join("?" * len(conv_ids))
 
     rows = conn.execute("""
         SELECT id, timestamp, archive_id, attachment_path
         FROM messages
-        WHERE conversation_id = ? AND has_attachment = 1 AND attachment_path IS NOT NULL
+        WHERE conversation_id IN (%s) AND has_attachment = 1 AND attachment_path IS NOT NULL
         ORDER BY timestamp ASC NULLS LAST
-    """, (conv["id"],)).fetchall()
+    """ % placeholders, conv_ids).fetchall()
     conn.close()
 
     results = []
@@ -1625,10 +1751,11 @@ def api_conversation_search():
         return jsonify({"results": []})
 
     conn = get_db()
-    conv = conn.execute("SELECT id FROM conversations WHERE filename=?", (filename,)).fetchone()
-    if not conv:
+    conv_ids = resolve_conversation_ids(conn, filename)
+    if not conv_ids:
         conn.close()
         return jsonify({"results": []})
+    placeholders = ",".join("?" * len(conv_ids))
 
     import shlex
     try:
@@ -1652,10 +1779,10 @@ def api_conversation_search():
             "snippet(messages_fts, 0, '<mark>', '</mark>', '...', 12) as snip "
             "FROM messages_fts f "
             "JOIN messages m ON m.rowid = f.rowid "
-            "WHERE messages_fts MATCH ? AND m.conversation_id = ? "
+            "WHERE messages_fts MATCH ? AND m.conversation_id IN (%s) "
             "ORDER BY m.timestamp ASC NULLS LAST "
-            "LIMIT 200",
-            (fts_query, conv["id"])
+            "LIMIT 200" % placeholders,
+            [fts_query] + conv_ids
         ).fetchall()
     except sqlite3.OperationalError as e:
         conn.close()

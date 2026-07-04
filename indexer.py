@@ -27,6 +27,7 @@ from datetime import datetime
 ARCHIVE_ROOT = os.environ.get("ARCHIVE_ROOT", "/archives")
 DB_PATH = os.environ.get("DB_PATH", "/data/imessage.db")
 MODEL_DIR = os.environ.get("MODEL_DIR", "/data/models")
+ADDRESSBOOK_CACHE_DIR = os.environ.get("ADDRESSBOOK_CACHE_DIR", "/addressbook-cache")
 
 IMAGE_EXTS = frozenset({'.heic', '.heif', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'})
 
@@ -59,16 +60,27 @@ MONTHS = {
 
 # ── Discovery ────────────────────────────────────────────────────────────────
 
-def is_export_dir(path):
-    """Return True if path looks like an imessage-exporter output directory."""
+def is_export_dir(path, shared_attachment_root=None):
+    """
+    Return True if path looks like an imessage-exporter output directory:
+    it has .html files, and either has its own attachments folder OR
+    (when shared_attachment_root is given) a shared attachments folder
+    exists at that root instead. The latter supports a layout where
+    attachments are kept in one folder outside imessage-exporter's own
+    control entirely (e.g. an independent rsync from the live Messages
+    Attachments folder), with multiple separate export runs' .html files
+    referencing back into it, rather than each run copying its own.
+    """
     p = Path(path)
     has_html = any(p.glob("*.html"))
-    # FORK: originally only checked for a lowercase "attachments" folder.
-    # Now accepts any of the recognized attachment-folder names, so a
-    # directory using this fork's source layout (Attachments/StickerCache)
-    # is recognized too, not just the upstream default.
-    has_attachments = any((p / name).is_dir() for name in ATTACHMENT_DIR_NAMES)
-    return has_html and has_attachments
+    if not has_html:
+        return False
+    if any((p / name).is_dir() for name in ATTACHMENT_DIR_NAMES):
+        return True
+    if shared_attachment_root is not None:
+        shared = Path(shared_attachment_root)
+        return any((shared / name).is_dir() for name in ATTACHMENT_DIR_NAMES)
+    return False
 
 
 def discover_archives(root, quiet=False):
@@ -86,15 +98,15 @@ def discover_archives(root, quiet=False):
         return []
 
     found = []
-    if is_export_dir(root):
+    if is_export_dir(root, shared_attachment_root=root):
         found.append(root)
 
     for child in sorted(root.iterdir()):
-        if child.is_dir() and is_export_dir(child):
+        if child.is_dir() and is_export_dir(child, shared_attachment_root=root):
             found.append(child)
         elif child.is_dir():
             for grandchild in sorted(child.iterdir()):
-                if grandchild.is_dir() and is_export_dir(grandchild):
+                if grandchild.is_dir() and is_export_dir(grandchild, shared_attachment_root=root):
                     found.append(grandchild)
 
     found.sort(key=lambda p: p.stat().st_mtime)
@@ -439,6 +451,23 @@ def init_db(conn):
         PRIMARY KEY (attachment_path, archive_id)
     );
     CREATE INDEX IF NOT EXISTS idx_embeddings_msg ON image_embeddings(message_id);
+
+    -- FORK addition: contact-based conversation grouping. A 1:1
+    -- conversation whose handle resolves to a known Address Book contact
+    -- gets linked here to every OTHER conversation that resolves to the
+    -- SAME contact (e.g. their phone number's file and their email's
+    -- file), so the app can present them as one merged conversation.
+    -- Deliberately additive and separate from conversations/messages,
+    -- which are never modified by this -- see populate_contact_groups().
+    CREATE TABLE IF NOT EXISTS contact_groups (
+        contact_key TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS conversation_contact_group (
+        conversation_id INTEGER PRIMARY KEY REFERENCES conversations(id),
+        contact_key TEXT NOT NULL REFERENCES contact_groups(contact_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ccg_contact_key ON conversation_contact_group(contact_key);
     """)
     conn.commit()
 
@@ -686,6 +715,146 @@ def embed_images(conn):
             print(f"  Image embedding: {done:,}/{total:,} ({pct:.0f}%)", flush=True)
     print(f"Image embedding: {done:,} embedded, {errors} skipped")
 
+# ── Contact grouping ─────────────────────────────────────────────────────────
+# FORK addition: links 1:1 conversations that resolve to the same Address
+# Book contact (e.g. someone's phone number file and their email file) so
+# the app can present them as one merged conversation. Ported directly
+# from merge_by_contact.py's own handle-resolution logic (norm_phone,
+# norm_email, norm_handle, build_handle_map) rather than reimplemented,
+# since that logic is already correct and already tested; only the
+# Address Book path source changes here, pointed at the read-only cache
+# mount this container gets instead of the live system path merge_by_
+# contact.py itself uses. See conversation_contact_group in init_db() for
+# why this is additive rather than a rewrite of conversations/messages.
+
+def norm_phone(s):
+    d = re.sub(r"\D", "", s or "")
+    if not d:
+        return (s or "").strip().lower()
+    if len(d) == 11 and d[0] == "1":
+        return d[1:]
+    return d
+
+def norm_email(s):
+    return (s or "").strip().lower()
+
+def norm_handle(h):
+    return norm_email(h) if "@" in h else norm_phone(h)
+
+
+def get_addressbook_cache_paths(cache_dir):
+    """
+    Mirror merge_by_contact.py's default_addressbook_paths(), but pointed
+    at this container's read-only Address Book cache mount instead of the
+    live system path -- the cache is what update-addressbook-cache logic
+    (see imessage-incremental-sync.sh) keeps current, since the live path
+    is TCC-protected and unreachable from here regardless.
+    """
+    cache_dir = Path(cache_dir)
+    if not cache_dir.exists():
+        return []
+    found = []
+    main = cache_dir / "AddressBook-v22.abcddb"
+    if main.is_file():
+        found.append(str(main))
+    for src in sorted(cache_dir.glob("Sources/*/AddressBook-v22.abcddb")):
+        found.append(str(src))
+    return found
+
+
+def build_handle_map(ab_paths):
+    """
+    Return {normalized_handle: (contact_key, display_name)} across every
+    given Address Book DB. contact_key is namespaced by db path so
+    records from different source DBs (iCloud/Exchange/On My Mac) can
+    never collide just because they happen to share the same internal
+    row number. Schema is introspected defensively since ZABCDRECORD's
+    exact columns can vary slightly across macOS versions.
+    """
+    handle_map = {}
+    for dbp in ab_paths:
+        try:
+            con = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
+        except Exception as e:
+            print(f"  (skipping unreadable Address Book: {dbp}: {e})")
+            continue
+        try:
+            tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "ZABCDRECORD" not in tables:
+                con.close(); continue
+            names = {}
+            for pk, fn, ln, org in con.execute(
+                "SELECT Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION FROM ZABCDRECORD"):
+                nm = " ".join(x for x in (fn, ln) if x) or (org or f"record{pk}")
+                names[pk] = nm
+            def add(owner, raw):
+                if owner is None or not raw:
+                    return
+                key = norm_handle(raw)
+                if key:
+                    handle_map[key] = (f"{dbp}#{owner}", names.get(owner, f"record{owner}"))
+            if "ZABCDPHONENUMBER" in tables:
+                for owner, num in con.execute(
+                    "SELECT ZOWNER, ZFULLNUMBER FROM ZABCDPHONENUMBER"):
+                    add(owner, num)
+            if "ZABCDEMAILADDRESS" in tables:
+                for owner, addr in con.execute(
+                    "SELECT ZOWNER, ZADDRESS FROM ZABCDEMAILADDRESS"):
+                    add(owner, addr)
+        except Exception as e:
+            print(f"  (error reading {dbp}: {e})")
+        finally:
+            con.close()
+    return handle_map
+
+
+def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
+    """
+    (Re)build contact_groups / conversation_contact_group from the Address
+    Book cache. Only 1:1 conversations are considered -- group-chat
+    filenames contain a comma and are always skipped, since a group's
+    identity is its whole participant set, not any single member. Wipes
+    and rebuilds both tables on every call so a renamed contact or an
+    updated cache take effect immediately, without touching conversations
+    or messages at all -- if the cache is stale or missing entirely, this
+    just leaves both tables empty and every conversation behaves exactly
+    as if grouping didn't exist, the same graceful degradation the sync
+    script's own Address Book handling already has.
+    """
+    ab_paths = get_addressbook_cache_paths(cache_dir)
+    if not ab_paths:
+        print(f"No address book cache found at {cache_dir}; contact grouping skipped.")
+        return 0
+    handle_map = build_handle_map(ab_paths)
+    if not handle_map:
+        return 0
+
+    conn.execute("DELETE FROM conversation_contact_group")
+    conn.execute("DELETE FROM contact_groups")
+
+    grouped = 0
+    for row in conn.execute("SELECT id, filename FROM conversations").fetchall():
+        stem = Path(row["filename"]).stem
+        if "," in stem:
+            continue
+        person = handle_map.get(norm_handle(stem))
+        if not person:
+            continue
+        contact_key, display_name = person
+        conn.execute(
+            "INSERT OR IGNORE INTO contact_groups (contact_key, display_name) VALUES (?,?)",
+            (contact_key, display_name)
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO conversation_contact_group (conversation_id, contact_key) VALUES (?,?)",
+            (row["id"], contact_key)
+        )
+        grouped += 1
+    conn.commit()
+    print(f"Contact grouping: {grouped} conversation(s) linked to {len(ab_paths)} address book source(s).")
+    return grouped
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def run_indexer():
@@ -745,6 +914,10 @@ def run_indexer():
     convs = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
     archs = conn.execute("SELECT COUNT(*) FROM archives").fetchone()[0]
     print(f"\nDone: {archs} archives, {convs} conversations, {msgs:,} messages")
+
+    print()
+    populate_contact_groups(conn)
+
     conn.close()
 
 
@@ -825,6 +998,6 @@ if __name__ == "__main__":
         embed_images(conn)
         conn.close()
     elif len(sys.argv) > 1 and sys.argv[1] == 'watch':
-        watch_and_reindex(int(os.environ.get("WATCH_INTERVAL_SECONDS", "60")))
+        watch_and_reindex(int(os.environ.get("WATCH_INTERVAL_SECONDS", "3600")))
     else:
         run_indexer()
