@@ -792,16 +792,46 @@ def embed_images(conn):
 # contact.py itself uses. See conversation_contact_group in init_db() for
 # why this is additive rather than a rewrite of conversations/messages.
 
+def _strip_stray_quotes(s):
+    """
+    Strip any leading and/or trailing quote character (single or double),
+    independently of each other -- NOT as a matched pair. Guards against a
+    common, easy mistake when setting IMESSAGE_MY_HANDLES: quoting the
+    whole KEY=VALUE line in a docker-compose.yml `environment:` list entry
+    doesn't do what it looks like it does -- YAML only treats a value as
+    quoted when the quote is the very FIRST character of the scalar, not
+    when it appears after a literal `KEY=` prefix, so the quote characters
+    end up baked into the value verbatim. Worse, once a multi-handle
+    string like `"+1555 user@x.com"` gets split on whitespace, the
+    surviving quote characters land on DIFFERENT tokens -- the first
+    token keeps only the leading quote, the last token keeps only the
+    trailing one -- so neither token has a matched pair at its own
+    boundaries; each end has to be checked and stripped independently.
+    A phone number survives this by accident anyway (norm_phone strips
+    every non-digit character regardless), but an email address doesn't,
+    since email normalization was never written to expect a literal quote
+    character -- "user@x.com\"" then silently fails to match the clean
+    "user@x.com" computed from an actual filename, with no error anywhere
+    to point at why.
+    """
+    s = s.strip()
+    if s and s[0] in ('"', "'"):
+        s = s[1:]
+    if s and s[-1] in ('"', "'"):
+        s = s[:-1]
+    return s.strip()
+
+
 def norm_phone(s):
-    d = re.sub(r"\D", "", s or "")
+    d = re.sub(r"\D", "", _strip_stray_quotes(s or ""))
     if not d:
-        return (s or "").strip().lower()
+        return _strip_stray_quotes(s or "").lower()
     if len(d) == 11 and d[0] == "1":
         return d[1:]
     return d
 
 def norm_email(s):
-    return (s or "").strip().lower()
+    return _strip_stray_quotes(s or "").lower()
 
 def norm_handle(h):
     return norm_email(h) if "@" in h else norm_phone(h)
