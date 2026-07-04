@@ -143,6 +143,22 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 .conv-search input { flex: 1; background: #3a3a3c; border: none; border-radius: 8px;
              padding: 6px 12px; color: #f2f2f7; font-size: 13px; outline: none; }
 .conv-search-count { font-size: 12px; color: #8e8e93; white-space: nowrap; min-width: 70px; text-align: right; }
+.attachments-viewer { display: none; flex: 1; flex-direction: column; overflow: hidden; min-height: 0; }
+.attachments-viewer-header { padding: 10px 16px; background: #2c2c2e; border-bottom: 1px solid #3a3a3c;
+                             display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+.attachments-viewer-header span { font-size: 14px; font-weight: 600; }
+.attachments-grid { flex: 1; overflow-y: auto; padding: 16px; display: grid; min-width: 0;
+                    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+                    grid-auto-rows: 120px; gap: 8px; align-content: start; }
+.attachment-thumb { border-radius: 8px; overflow: hidden; cursor: pointer;
+                    background: #3a3a3c; border: 1px solid #3a3a3c; }
+.attachment-thumb:hover { border-color: #0a84ff; }
+.attachment-thumb img, .attachment-thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.attachment-thumb.attachment-file { display: flex; flex-direction: column; align-items: center;
+                    justify-content: center; gap: 6px; padding: 10px; }
+.attachment-file-icon { font-size: 28px; line-height: 1; }
+.attachment-file-name { font-size: 11px; color: #8e8e93; text-align: center; word-break: break-word;
+                    overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .date-jump label { font-size: 11px; color: #8e8e93; white-space: nowrap; }
 .date-jump select { background: #3a3a3c; border: none; border-radius: 8px;
   padding: 4px 8px; color: #f2f2f7; font-size: 12px; outline: none; cursor: pointer; }
@@ -431,6 +447,7 @@ def index():
       <div class="page-controls">
         <span class="page-info" id="pageInfo"></span>
         <button class="btn" id="convSearchToggleBtn" onclick="toggleConvSearch()" title="Search this conversation">&#128269;</button>
+        <button class="btn" id="attachmentsViewerToggleBtn" onclick="toggleAttachmentsViewer()" title="View all photos & videos">&#128247;</button>
         <button class="btn" id="dateJumpToggleBtn" onclick="toggleDateJump()" title="Jump to date" disabled>&#128197;</button>
         <button class="btn" id="jumpTopBtn" onclick="jumpToTop()" title="Jump to top">&#8607;</button>
         <button class="btn" id="jumpBottomBtn" onclick="jumpToBottom()" title="Jump to bottom">&#8609;</button>
@@ -465,6 +482,13 @@ def index():
     </div>
     <div class="messages" id="messages">
       <div class="empty"><div class="empty-icon">💬</div><div>Select a conversation</div></div>
+    </div>
+    <div class="attachments-viewer" id="attachmentsViewer" style="display:none">
+      <div class="attachments-viewer-header">
+        <span>Attachments</span>
+        <button class="btn" onclick="closeAttachmentsViewer()" title="Close">&times;</button>
+      </div>
+      <div class="attachments-grid" id="attachmentsGrid"></div>
     </div>
     <div class="loading-bar" id="loadingBar" style="display:none">Loading...</div>
   </div>
@@ -566,6 +590,7 @@ function loadConv(el) {
   currentFn = fn; hlTs = null; hlMid = null;
   closeConvSearch();
   closeDateJump();
+  closeAttachmentsViewer();
   document.getElementById('dateJumpToggleBtn').disabled = true;
   dateJumpInitializedFor = null;
   document.querySelectorAll('.conv-item').forEach(function(e){ e.classList.remove('active'); });
@@ -617,7 +642,11 @@ function fetchRows(unused, mode) {
           + '&per_page=' + WIN
           + '&offset=' + Math.max(0, fetchOffset);
 
-  fetch(url)
+  // priority:'high' is just a hint (ignored harmlessly on browsers that
+  // don't support it), but it helps this take precedence over any
+  // straggling attachment-grid image/video requests still being torn
+  // down in the background right after closing that grid.
+  fetch(url, {priority: 'high'})
     .then(function(r){ return r.json(); })
     .then(function(d) {
       totalMsgs = d.total;
@@ -992,6 +1021,100 @@ function jumpToConvSearchResult(idx) {
     });
 }
 
+// ── Attachments viewer ────────────────────────────────────────────────────────
+// Shows every image/video in the current conversation as a grid. Clicking a
+// thumbnail closes the grid and jumps to that message using the exact same
+// row-lookup-and-scroll mechanism as everything else (conv search, date
+// jump, global search results) -- it does NOT open the lightbox directly.
+// The lightbox's own click handler is scoped to images inside #messages, so
+// once jumpToAttachment() lands you on the real message with the image
+// rendered inline, clicking THAT image is what opens the lightbox -- the
+// existing behavior, untouched.
+function toggleAttachmentsViewer() {
+  var viewer = document.getElementById('attachmentsViewer');
+  if (viewer.style.display === 'flex') {
+    closeAttachmentsViewer();
+  } else {
+    openAttachmentsViewer();
+  }
+}
+
+function openAttachmentsViewer() {
+  if (!currentFn) return;
+  var viewer = document.getElementById('attachmentsViewer');
+  var grid = document.getElementById('attachmentsGrid');
+  grid.innerHTML = '<div class="empty"><div>Loading...</div></div>';
+  viewer.style.display = 'flex';
+  document.getElementById('messages').style.display = 'none';
+  fetch('/api/conversation_attachments?filename=' + encodeURIComponent(currentFn))
+    .then(function(r){ return r.json(); })
+    .then(function(d) { renderAttachmentsGrid(d.attachments || []); })
+    .catch(function() {
+      grid.innerHTML = '<div class="empty"><div>Could not load attachments</div></div>';
+    });
+}
+
+function closeAttachmentsViewer() {
+  document.getElementById('attachmentsViewer').style.display = 'none';
+  document.getElementById('messages').style.display = 'flex';
+  // display:none only hides the grid -- it does NOT cancel in-flight
+  // network requests for thumbnails still loading. Clearing src directly
+  // on each element is a more immediate abort signal than just removing
+  // them from the document and waiting on garbage collection to trigger
+  // it; doing both together is the most reliable way to actually stop
+  // that background traffic before it competes with the conversation
+  // fetch that's about to happen.
+  var grid = document.getElementById('attachmentsGrid');
+  grid.querySelectorAll('img, video').forEach(function(el) {
+    el.removeAttribute('src');
+    el.src = '';
+  });
+  grid.innerHTML = '';
+}
+
+function renderAttachmentsGrid(attachments) {
+  var grid = document.getElementById('attachmentsGrid');
+  if (!attachments.length) {
+    grid.innerHTML = '<div class="empty"><div class="empty-icon">&#128206;</div><div>No attachments in this conversation</div></div>';
+    return;
+  }
+  grid.innerHTML = attachments.map(function(a) {
+    var path = a.attachment_path || '';
+    var isImage = /[.](heic|heif|jpg|jpeg|png|gif|webp|bmp)$/i.test(path);
+    var isVideo = /[.](mov|mp4|m4v|avi)$/i.test(path);
+    var url = esc(a.attachment_url);
+    var mid = esc(a.id);
+    var media, cls;
+    if (isImage) {
+      media = '<img src="' + url + '" loading="lazy">';
+      cls = 'attachment-thumb';
+    } else if (isVideo) {
+      media = '<video src="' + url + '" muted preload="none"></video>';
+      cls = 'attachment-thumb';
+    } else {
+      var fname = path.split('/').pop() || 'Attachment';
+      media = '<div class="attachment-file-icon">&#128196;</div><div class="attachment-file-name">' + esc(fname) + '</div>';
+      cls = 'attachment-thumb attachment-file';
+    }
+    return '<div class="' + cls + '" onclick="jumpToAttachment(`' + mid + '`)">' + media + '</div>';
+  }).join('');
+}
+
+function jumpToAttachment(msgId) {
+  if (!currentFn) return;
+  closeAttachmentsViewer();
+  var existing = document.querySelector('.message-row[data-mid="' + msgId + '"]');
+  if (existing) { existing.scrollIntoView({block: 'center'}); flashHighlight(existing); return; }
+  fetch('/api/message_page?filename=' + encodeURIComponent(currentFn) + '&msg_id=' + encodeURIComponent(msgId) + '&per_page=' + WIN, {priority: 'high'})
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (!d.row) return;
+      hlMid = msgId;
+      resetPane();
+      fetchRows(null, 'initial-row:' + (d.row - 1));
+    });
+}
+
 // ── Jump to top / bottom ──────────────────────────────────────────────────────
 function jumpToTop() {
   // Reuses 'initial-top' mode (built for date/year jumps) targeting row 0 --
@@ -1326,6 +1449,48 @@ def api_reply_parent():
     ).fetchone()[0]
     conn.close()
     return jsonify({"parent_id": row["id"], "row": row_num})
+
+
+# ── API: all attachments in one conversation ──────────────────────────────────
+# FORK addition: powers the attachment viewer. Returns every attachment in a
+# conversation, of any type, so the frontend can render a grid; clicking a
+# thumbnail reuses the same jump-to-message machinery as everything else
+# (see jumpToAttachment() in the frontend below), not the lightbox -- the
+# lightbox only ever applies to images already rendered inline in the
+# conversation, which is a separate click handler scoped to #messages.
+
+@app.route("/api/conversation_attachments")
+def api_conversation_attachments():
+    filename = request.args.get("filename", "")
+    if not filename:
+        return jsonify({"attachments": []})
+
+    conn = get_db()
+    conv = conn.execute("SELECT id FROM conversations WHERE filename=?", (filename,)).fetchone()
+    if not conv:
+        conn.close()
+        return jsonify({"attachments": []})
+
+    rows = conn.execute("""
+        SELECT id, timestamp, archive_id, attachment_path
+        FROM messages
+        WHERE conversation_id = ? AND has_attachment = 1 AND attachment_path IS NOT NULL
+        ORDER BY timestamp ASC NULLS LAST
+    """, (conv["id"],)).fetchall()
+    conn.close()
+
+    results = []
+    for r in rows:
+        path = r["attachment_path"] or ""
+        aid = str(r["archive_id"])
+        results.append({
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "attachment_url": "/attachments/" + aid + "/" + strip_attachment_prefix(path),
+            "attachment_path": path,
+        })
+
+    return jsonify({"attachments": results})
 
 
 # ── API: search within one conversation ──────────────────────────────────────
