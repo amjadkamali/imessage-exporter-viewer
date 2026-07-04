@@ -1352,7 +1352,7 @@ function renderConvInfo(data) {
       html += '</div>';
     });
   } else if (data.is_named_group) {
-    html += '<div class="conv-info-empty">No participant data found -- this export may predate chat.db-based participant lookup, or the underlying chat is no longer present in a recent snapshot.</div>';
+    html += '';
   } else {
     html += '<div class="conv-info-empty">No participant details available.</div>';
   }
