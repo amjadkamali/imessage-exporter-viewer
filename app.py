@@ -1280,18 +1280,20 @@ function lightboxNav(direction) {
   if (lightboxLoading) return;
   var images = lightboxImages();
   var idx = images.indexOf(currentLightboxImg);
-  if (idx === -1) return;
-  var next = images[idx + direction];
-  if (next) {
-    openLightbox(next);
-    return;
+  if (idx !== -1) {
+    var next = images[idx + direction];
+    if (next) {
+      openLightbox(next);
+      return;
+    }
   }
-  // Reached the edge of what's currently rendered. Extend the loaded
-  // window in that direction using the exact same fetch the virtual
-  // scroll itself uses (append/prepend), then try again -- this keeps
-  // extending automatically through any stretch of text-only messages
-  // until it either finds the next image or genuinely reaches the start
-  // or end of the conversation.
+  // Either idx was valid but nothing adjacent is loaded yet, or the
+  // tracked image has been culled from the DOM entirely -- the virtual
+  // scroll keeps the DOM bounded, and during a long multi-extend search
+  // (a long stretch of text-only messages before the next/prev image
+  // turns up) the image we started from can legitimately get culled
+  // before the search finishes. Either way, extend the loaded window
+  // further in this direction and look again.
   var canLoadMore = direction > 0 ? domEnd < totalMsgs : domStart > 0;
   // fetchRows() silently no-ops if a fetch is already in flight for some
   // other reason (e.g. a scroll-triggered sentinel) -- without this check,
@@ -1299,10 +1301,25 @@ function lightboxNav(direction) {
   // stuck true forever. Bailing here just means this attempt does nothing;
   // pressing the arrow again a moment later works normally.
   if (!canLoadMore || loading) return;
+  var imagesBefore = images;
   lightboxLoading = true;
   fetchRows(function() {
     lightboxLoading = false;
-    lightboxNav(direction);
+    // Diff against the pre-fetch snapshot rather than just re-deriving an
+    // index -- this correctly identifies genuinely new arrivals even if
+    // the tracked reference was culled during this same extend (a simple
+    // "did the count go up" check would be fooled if old images were
+    // culled at the same time new ones arrived).
+    var newImages = lightboxImages();
+    var brandNew = newImages.filter(function(img) { return imagesBefore.indexOf(img) === -1; });
+    if (brandNew.length > 0) {
+      // newImages preserves document order, so for a forward search the
+      // first brand-new arrival is the closest one; for a backward
+      // search (new content prepended at the top) the last one is.
+      openLightbox(direction > 0 ? brandNew[0] : brandNew[brandNew.length - 1]);
+    } else {
+      lightboxNav(direction);
+    }
   }, direction > 0 ? 'append' : 'prepend');
 }
 
