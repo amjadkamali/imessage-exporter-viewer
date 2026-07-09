@@ -1278,9 +1278,25 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
                 display_name = prefix
             else:
                 person = handle_map.get(norm_handle(stem))
-                if not person:
-                    continue
-                contact_key, display_name = person
+                if person:
+                    contact_key, display_name = person
+                else:
+                    # FIX: previously `continue`'d here with no fallback,
+                    # meaning two bare-handle files for the exact same
+                    # number (e.g. "+1...(smsfp)" / "+1...(smsft)" -- real
+                    # imessage-exporter appends these when a number briefly
+                    # has two parallel internal chat rows) never got linked
+                    # unless that number was a saved Address Book contact.
+                    # The multi-person group path already has exactly this
+                    # fallback (see "unresolved:" above); this brings the
+                    # bare-handle path to parity with it, so normalized-
+                    # handle matching alone is enough to merge two files for
+                    # the same number even with zero Address Book data.
+                    norm = norm_handle(stem)
+                    if not norm:
+                        continue
+                    contact_key = "unresolved:" + norm
+                    display_name = stem
 
         conn.execute(
             "INSERT OR IGNORE INTO contact_groups (contact_key, display_name) VALUES (?,?)",
