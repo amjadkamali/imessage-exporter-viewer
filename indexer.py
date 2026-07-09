@@ -30,6 +30,13 @@ DB_PATH = os.environ.get("DB_PATH", "/data/imessage.db")
 MODEL_DIR = os.environ.get("MODEL_DIR", "/data/models")
 ADDRESSBOOK_CACHE_DIR = os.environ.get("ADDRESSBOOK_CACHE_DIR", "/addressbook-cache")
 MY_HANDLES = os.environ.get("IMESSAGE_MY_HANDLES", "")
+# Manual override for contacts the Address Book itself can't unify -- e.g. the
+# same real person saved as two separate, un-merged records across different
+# sources (iCloud + Exchange, say), each with a different phone number. No
+# amount of handle normalization can bridge that on its own since there's no
+# shared data point between the two records; this file is how you tell the
+# indexer directly. See apply_manual_merges() for the format and behavior.
+MANUAL_MERGES_PATH = os.environ.get("MANUAL_MERGES_PATH", os.path.join(ARCHIVE_ROOT, "manual_contact_merges.json"))
 
 IMAGE_EXTS = frozenset({'.heic', '.heif', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'})
 
@@ -983,6 +990,77 @@ def build_handle_map(ab_paths):
 NAMED_GROUP_SUFFIX_RE = re.compile(r'^(.+?)\s*-\s*(\d+)$')
 
 
+def load_manual_merges(path=MANUAL_MERGES_PATH):
+    """
+    Read the manual contact-merge override file, if present. Format:
+        [
+          ["+15555555555", "+14445555555"],
+          ["old.email@example.com", "+15551234567", "new.email@example.com"]
+        ]
+    Each inner list is a group of handles known (by the person running this,
+    not by any Address Book data) to belong to the same real contact. Missing
+    file or malformed content is treated exactly like a missing Address Book
+    cache elsewhere in this project: skipped silently, everything else
+    continues to work as if this feature didn't exist.
+    """
+    if not os.path.isfile(path):
+        return []
+    try:
+        data = json.loads(open(path, encoding="utf-8").read())
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"  (skipping unreadable manual merges file {path}: {e})")
+        return []
+    if not isinstance(data, list):
+        print(f"  (skipping {path}: expected a JSON list of lists, got {type(data).__name__})")
+        return []
+    groups = []
+    for i, group in enumerate(data):
+        if not isinstance(group, list) or not all(isinstance(h, str) and h for h in group):
+            print(f"  (skipping malformed group #{i} in {path}: expected a list of handle strings)")
+            continue
+        if len(group) >= 2:
+            groups.append(group)
+    return groups
+
+
+def apply_manual_merges(handle_map, merge_groups):
+    """
+    Correct handle_map so every handle in a manual merge group resolves to
+    the SAME contact_key, even when the Address Book itself has them as
+    separate, un-merged records (the exact scenario this exists for: the
+    same person saved as two different contacts across two different
+    sources, e.g. iCloud + Exchange, each with only one of their numbers --
+    there's no shared data point for normal matching to find on its own).
+
+    For each group: of the handles that DO already resolve to a contact_key,
+    the first one found (in the group's own listed order) is treated as
+    canonical -- every OTHER handle in the group, whether it resolved to a
+    DIFFERENT contact_key or to no contact_key at all, gets remapped to that
+    same canonical key. This is a correction layer only: it never touches
+    the Address Book data itself, never touches conversations/messages, and
+    is fully re-derived from the override file every run, so an edit there
+    takes effect on the next reindex with nothing else to clean up.
+    Returns a NEW dict; the input is not mutated.
+    """
+    handle_map = dict(handle_map)
+    for group in merge_groups:
+        normed = [(h, norm_handle(h)) for h in group]
+        canonical = None
+        for raw, norm in normed:
+            if norm in handle_map:
+                canonical = handle_map[norm]
+                break
+        if canonical is None:
+            # None of these handles are in the Address Book at all -- still
+            # unify them under a synthetic key so they at least merge with
+            # EACH OTHER, using the first handle as the display name.
+            canonical = ("manual:" + normed[0][1], normed[0][0])
+        for raw, norm in normed:
+            if norm:
+                handle_map[norm] = canonical
+    return handle_map
+
+
 def _raw_participant_sets(conn):
     """
     Return {conversation_id: set(normalized handles)} for every
@@ -1071,6 +1149,11 @@ def populate_contact_groups(conn, cache_dir=ADDRESSBOOK_CACHE_DIR):
         print(f"No address book cache found at {cache_dir}; handle-based contact grouping skipped "
               f"(named-group name-collision merging, which doesn't need it, still runs).")
     handle_map = build_handle_map(ab_paths) if ab_paths else {}
+
+    manual_groups = load_manual_merges()
+    if manual_groups:
+        handle_map = apply_manual_merges(handle_map, manual_groups)
+        print(f"Manual contact merges: applied {len(manual_groups)} override group(s) from {MANUAL_MERGES_PATH}.")
 
     my_handles_norm = frozenset(norm_handle(h) for h in MY_HANDLES.split() if h.strip())
 
